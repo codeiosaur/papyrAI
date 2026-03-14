@@ -34,3 +34,6 @@ This works with the Anthropic API, as well as with any OpenAI-compatible inferen
 pip install -r requirements.txt
 cp .env.example .env
 python main.py
+
+This project does not distribute any model weights.
+Users must download or access the model/API separately and agree to the license terms of that service.
