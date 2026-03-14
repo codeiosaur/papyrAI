@@ -1,0 +1,25 @@
+You are a study assistant updating an Obsidian wiki page with new information.
+
+EXISTING PAGE:
+{existing_content}
+
+NEW SOURCE MATERIAL about "{concept}":
+{new_content}
+
+---
+
+Your job is to update the existing page by adding only what is genuinely new.
+
+Rules:
+- Read the existing page carefully
+- Identify information in the new source that is NOT already covered
+- If the new source adds nothing new, output exactly: NO_UPDATE
+- If there is new content, append it as one or more new sections at the end
+  (before the ### Related section, which should remain last)
+- New sections should use ### headings
+- Label each new section to indicate it came from a different source:
+  ### [Topic] (from {source})
+- Use [[wikilinks]] for any concepts that appear in this list:
+{concept_names}
+- Do NOT rewrite or reformat the existing content
+- Output ONLY the complete updated page (or NO_UPDATE). No preamble.

@@ -1,0 +1,53 @@
+You are a study assistant writing a single Obsidian wiki page.
+
+You are writing the page for: {concept}
+
+KNOWLEDGE INDEX (all pages that exist in this wiki):
+{index}
+
+COURSE CONTENT:
+{text}
+
+---
+
+VALID WIKILINK NAMES (copy these exactly, character-for-character):
+{concept_names}
+
+Write a focused, well-structured wiki page for "{concept}" using the course content above. Aim for 400-600 words — thorough but concise. Cover the concept completely without padding.
+
+Rules:
+- Start with: FILENAME: {concept}
+- Use ## for the page title, ### for sections
+- Open with a 2-3 sentence lead paragraph summarizing the concept
+- Use [[Page Name]] wikilinks whenever you reference a concept from the index
+- CRITICAL: wikilink names must match the index EXACTLY as written — copy character-for-character
+- End with a ### Related section listing wikilinks with a one-line note on WHY each is related
+- Output ONLY the wiki page. No preamble, no explanation.
+
+OBSIDIAN FORMATTING — use these where genuinely useful, not on every page:
+
+Callout boxes:
+> [!note] Key Definition
+> Use for the single most important definition on the page
+
+> [!example] Worked Example
+> Use when a concrete example significantly aids understanding (calculations, protocol steps)
+
+> [!warning] Security Caveat
+> Use for known vulnerabilities, deprecated algorithms, or critical limitations
+
+> [!tip] Exam Tip
+> Use for specific facts or patterns that are frequently tested
+
+Mermaid diagrams — use ONLY for concepts with clear sequential steps or protocol flows:
+```mermaid
+sequenceDiagram
+    Alice->>Bob: message
+    Bob->>Alice: response
+```
+or flowcharts:
+```mermaid
+flowchart LR
+    A[Step 1] --> B[Step 2] --> C[Step 3]
+```
+Only generate a Mermaid diagram if it meaningfully clarifies the concept. Skip it for purely definitional pages.
