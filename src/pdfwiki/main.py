@@ -13,17 +13,27 @@ Pipeline:
 
 import re
 import argparse
+import sys
 from pathlib import Path
 from difflib import get_close_matches
 
+# Allow running this file directly: `python src/pdfwiki/main.py ...`
+# by ensuring `src/` is on sys.path for `import pdfwiki...`.
+if __package__ in (None, ""):
+    src_root = Path(__file__).resolve().parents[1]
+    if str(src_root) not in sys.path:
+        sys.path.insert(0, str(src_root))
+
 from pdfwiki.extractor import extract_text, split_into_chapters, chunk_text, chunk_by_page
 from pdfwiki.retriever import retrieve_chunks
-from pdfwiki.ai_client import query
+from pdfwiki.ai_client import query, set_provider, get_provider
 from pdfwiki.writer import write_wiki, write_flashcards, write_cheatsheet
 from pdfwiki.vault import load_vault_state, find_existing_page
 
 
-PROMPTS_DIR = Path(__file__).parent / "prompts"
+PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
+if not PROMPTS_DIR.exists():
+    PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 def load_prompt(name: str) -> str:
     return (PROMPTS_DIR / f"{name}.txt").read_text(encoding="utf-8")
@@ -140,7 +150,6 @@ def fix_wikilinks(content: str, concepts: list[str],
 def _normalize_concept(name: str) -> str:
     """Strip parentheticals and normalize for fuzzy comparison.
     'IND-CPA (Indistinguishability...)' → 'ind-cpa'
-    'RSA (Rivest-Shamir-Adleman)' → 'rsa'
     """
     return re.sub(r'\s*\([^)]+\)', '', name).strip().lower()
 
@@ -556,10 +565,23 @@ Examples:
                         help="Subject override. Single PDF only.")
     parser.add_argument("--batch", action="store_true",
                         help="Never prompt. Unknown subjects go to Unsorted/.")
+    parser.add_argument(
+        "--provider",
+        choices=["anthropic", "ollama"],
+        default=None,
+        help=(
+            "Model provider override for this run. "
+            "Defaults to PDF_TO_NOTES_PROVIDER from environment."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.subject and len(args.pdfs) > 1:
         parser.error("--subject can only be used with a single PDF")
+
+    if args.provider:
+        set_provider(args.provider)
+        print(f"Provider override: {get_provider()}")
 
     # Default vault: sibling folder next to the first PDF
     # e.g. ~/Documents/Cryptography.pdf → ~/Documents/vault/

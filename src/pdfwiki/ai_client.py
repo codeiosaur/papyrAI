@@ -16,7 +16,7 @@ from openai import OpenAI
 load_dotenv()
 
 # --- CONFIG ---
-PROVIDER = os.environ.get("PDF_TO_NOTES_PROVIDER", "claude").strip().lower()
+PROVIDER = os.environ.get("PDF_TO_NOTES_PROVIDER", "anthropic").strip().lower()
 
 # Claude models — swap either string to change quality/cost tradeoff
 CLAUDE_QUALITY_MODEL = os.environ.get(
@@ -34,6 +34,23 @@ OLLAMA_MODEL = os.environ.get("PDF_TO_NOTES_OLLAMA_MODEL", "llama3.1:8b")
 CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 
+def set_provider(provider: str) -> None:
+    """Set provider at runtime for the current process."""
+    normalized = provider.strip().lower()
+    if normalized not in {"anthropic", "ollama"}:
+        raise ValueError(
+            f"Unsupported provider: {provider}. Expected 'anthropic' or 'ollama'."
+        )
+
+    global PROVIDER
+    PROVIDER = normalized
+
+
+def get_provider() -> str:
+    """Return the currently active provider."""
+    return PROVIDER
+
+
 def query(
     prompt: str,
     system: str = "",
@@ -43,22 +60,23 @@ def query(
     """
     Send a prompt to the AI and return the response text.
 
+    When using Anthropic API:
     quality=True  → use CLAUDE_QUALITY_MODEL (Sonnet) — for wiki pages
     quality=False → use CLAUDE_FAST_MODEL (Haiku)    — for everything else
     """
-    if PROVIDER == "claude":
+    if PROVIDER == "anthropic":
         model = CLAUDE_QUALITY_MODEL if quality else CLAUDE_FAST_MODEL
-        return _query_claude(prompt, system, max_tokens, model)
+        return _query_anthropic(prompt, system, max_tokens, model)
     if PROVIDER == "ollama":
         return _query_ollama(prompt, system, max_tokens)
 
     raise ValueError(
         f"Unsupported PDF_TO_NOTES_PROVIDER: {PROVIDER}. "
-        "Expected 'claude' or 'ollama'."
+        "Expected 'anthropic' or 'ollama'."
     )
 
 
-def _query_claude(prompt: str, system: str, max_tokens: int, model: str) -> str:
+def _query_anthropic(prompt: str, system: str, max_tokens: int, model: str) -> str:
     if not CLAUDE_API_KEY:
         raise EnvironmentError(
             "ANTHROPIC_API_KEY not set. "

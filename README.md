@@ -35,5 +35,14 @@ pip install -r requirements.txt
 cp .env.example .env
 python main.py
 
+## Provider Selection
+
+You can switch providers per run using `--provider`:
+
+python src/pdfwiki/main.py notes.pdf --vault ./vault --provider ollama
+python src/pdfwiki/main.py notes.pdf --vault ./vault --provider anthropic
+
+If `--provider` is not specified, the app uses `PDF_TO_NOTES_PROVIDER` from environment.
+
 This project does not distribute any model weights.
 Users must download or access the model/API separately and agree to the license terms of that service.

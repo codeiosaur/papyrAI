@@ -115,3 +115,23 @@ def test_chapter_summary_text_skips_empty_chunk_lists(monkeypatch):
     ])
 
     assert summary == "summary:first\n\n---\n\nsummary:second"
+
+
+def test_run_cli_applies_provider_override(monkeypatch):
+    called = {}
+
+    monkeypatch.setattr(main, "set_provider", lambda value: called.setdefault("provider", value))
+    monkeypatch.setattr(main, "get_provider", lambda: called.get("provider", "claude"))
+    monkeypatch.setattr(main, "process_pdf", lambda *args, **kwargs: None)
+
+    exit_code = main.run_cli([
+        "sample.pdf",
+        "--vault",
+        "./vault",
+        "--batch",
+        "--provider",
+        "ollama",
+    ])
+
+    assert exit_code == 0
+    assert called["provider"] == "ollama"

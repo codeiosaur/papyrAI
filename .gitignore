@@ -6,6 +6,8 @@
 *.cert
 secrets.json
 config.local.py
+# Safe template
+!.env.example
  
 # Python
 .venv/
@@ -21,6 +23,5 @@ __pycache__/
 output*/
 vault/
 data/
-generated/
 tmp/
 *.pdf
