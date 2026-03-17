@@ -5,7 +5,7 @@ You are writing the page for: {concept}
 KNOWLEDGE INDEX (all pages that exist in this wiki):
 {index}
 
-COURSE CONTENT:
+FACTS:
 {text}
 
 ---
@@ -13,9 +13,11 @@ COURSE CONTENT:
 VALID WIKILINK NAMES (copy these exactly, character-for-character):
 {concept_names}
 
-Write a focused, well-structured wiki page for "{concept}" using the course content above. Aim for 400-600 words — thorough but concise. Cover the concept completely without padding.
+Write a focused, well-structured wiki page for "{concept}" using the facts above. Aim to be thorough but concise. Cover the concept completely without padding.
 
 Rules:
+- Use ONLY the facts provided
+- Do not invent new information
 - Start with: FILENAME: {concept}
 - Use ## for the page title, ### for sections
 - Open with a 2-3 sentence lead paragraph summarizing the concept

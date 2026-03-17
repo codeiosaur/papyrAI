@@ -50,12 +50,39 @@ def get_provider() -> str:
     """Return the currently active provider."""
     return PROVIDER
 
+def extract_facts(concept: str, context: str, max_tokens: int = 400) -> str:
+    """
+    Extract structured factual statements about a concept.
+    Uses a cheaper model if configured.
+    """
+
+    prompt = f"""
+    Extract clear, factual statements about "{concept}" from the text below.
+    
+    Rules:
+    - Use bullet points
+    - Be concise and precise
+    - No explanations, no fluff
+    - Avoid repetition
+    - Prefer atomic facts (one idea per bullet)
+    
+    TEXT:
+    {context}
+    """
+
+    return query(
+        prompt=prompt,
+        system="You extract factual knowledge for study notes.",
+        max_tokens=max_tokens,
+        quality=False
+    )
+
 
 def query(
     prompt: str,
     system: str = "",
     max_tokens: int = 4096,
-    quality: bool = False   # True = Sonnet, False = Haiku
+    quality: bool = False   # True = Sonnet, False = Haiku (Antrhopic only; Ollama ignores this flag)
 ) -> str:
     """
     Send a prompt to the AI and return the response text.

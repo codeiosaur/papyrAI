@@ -99,3 +99,25 @@ def test_retrieve_chunks_uses_bm25_for_specific_term_matching():
     )
 
     assert "Kasiski test" in selected
+
+
+def test_retrieve_ranked_chunks_returns_top_ranked_before_limiting():
+    chunks = [
+        "General overview.",
+        "RSA uses modular arithmetic and factoring hardness.",
+        "Symmetric encryption uses shared keys.",
+    ]
+
+    ranked = retriever.retrieve_ranked_chunks(chunks, concept="RSA", top_k=2)
+
+    assert len(ranked) == 2
+    assert "RSA uses modular arithmetic" in ranked[0]
+
+
+def test_limit_context_applies_char_budget():
+    chunks = ["A" * 1000, "B" * 1000, "C" * 1000]
+
+    context = retriever.limit_context(chunks, max_chars=1800)
+
+    assert len(context) <= 1800
+    assert "A" in context

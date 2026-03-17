@@ -38,6 +38,29 @@ RELATIONSHIPS:
     assert concepts == ["RSA", "AES"]
 
 
+def test_parse_index_handles_markdown_heading_and_colon_descriptions():
+    raw = """
+## CONCEPTS
+1) **RSA**: public key cryptosystem
+2) **Diffie-Hellman Key Exchange**: shared secret protocol
+
+## RELATIONSHIPS
+- RSA -> Diffie-Hellman: both public-key era concepts
+""".strip()
+
+    concepts, _ = main.parse_index(raw)
+
+    assert concepts == ["RSA", "Diffie-Hellman Key Exchange"]
+
+
+def test_parse_index_handles_inline_concepts_without_relationships_section():
+    raw = "CONCEPTS: RSA, AES, One-Time Pad (OTP)"
+
+    concepts, _ = main.parse_index(raw)
+
+    assert concepts == ["RSA", "AES", "One-Time Pad (OTP)"]
+
+
 def test_parse_wiki_page_uses_filename_header_when_present():
     raw = """FILENAME: RSA (Rivest-Shamir-Adleman)
 ## RSA (Rivest-Shamir-Adleman)
@@ -80,9 +103,29 @@ def test_find_near_duplicate_detects_normalized_and_prefix_matches():
     assert main.find_near_duplicate("Kasisky Test", vault_pages) == "Kasiski Test"
 
 
+# Currently uses cryptography terms; will add more as needed
+def test_find_near_duplicate_avoids_unrelated_terms():
+    vault_pages = [
+        "RSA Algorithm (Rivest-Shamir-Adleman)",
+        "Diffie-Hellman Key Exchange",
+    ]
+
+    assert main.find_near_duplicate("AES (Advanced Encryption Standard)", vault_pages) is None
+
+
 def test_detect_subject_prefers_readable_filename_without_ai_call():
     subject = main.detect_subject("Cryptography_pptx", concepts=[])
     assert subject == "Cryptography"
+
+    subject = main.detect_subject("Unit3_Spanish_pdf", concepts=[])
+    assert subject == "Spanish"
+
+    subject = main.detect_subject("European_History_docx", concepts=[])
+    assert subject == "European History"
+
+    subject = main.detect_subject("Week_4_Calculus_docx", concepts=[])
+    assert subject == "Calculus"
+
 
 
 def test_detect_subject_uses_ai_for_generic_names(monkeypatch):

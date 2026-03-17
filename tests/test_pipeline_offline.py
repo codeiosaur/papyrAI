@@ -87,6 +87,11 @@ def _mock_pipeline_dependencies(monkeypatch, index_outputs):
         "retrieve_chunks",
         lambda chunks, concept, related_concepts=None, top_k=3, max_chars=4000: f"relevant text for {concept}",
     )
+    monkeypatch.setattr(
+        main,
+        "extract_facts",
+        lambda concept, context, max_tokens=450: f"facts for {concept}",
+    )
 
     def fake_load_prompt(name: str) -> str:
         markers = {

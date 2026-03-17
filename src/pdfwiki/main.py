@@ -7,7 +7,7 @@ Pipeline:
   2. Split into chapters/sections
   3. Chunk each section into context-sized pieces
   4. Build concept index (Pass 1 — one API call)
-  5. For each concept, retrieve relevant chunks + generate wiki page (Pass 2)
+    5. For each concept, retrieve relevant chunks -> extract facts -> generate wiki page (Pass 2)
   6. Generate flashcards and cheat sheet from full text
 """
 
@@ -15,7 +15,7 @@ import re
 import argparse
 import sys
 from pathlib import Path
-from difflib import get_close_matches
+from difflib import get_close_matches, SequenceMatcher
 
 # Allow running this file directly: `python src/pdfwiki/main.py ...`
 # by ensuring `src/` is on sys.path for `import pdfwiki...`.
@@ -25,8 +25,8 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(src_root))
 
 from pdfwiki.extractor import extract_text, split_into_chapters, chunk_text, chunk_by_page
-from pdfwiki.retriever import retrieve_chunks
-from pdfwiki.ai_client import query, set_provider, get_provider
+from pdfwiki.retriever import retrieve_chunks, retrieve_ranked_chunks, limit_context
+from pdfwiki.ai_client import query, extract_facts, set_provider, get_provider
 from pdfwiki.writer import write_wiki, write_flashcards, write_cheatsheet
 from pdfwiki.vault import load_vault_state, find_existing_page
 
@@ -46,28 +46,85 @@ def parse_index(raw: str) -> tuple[list[str], str]:
     Extract concept names from index output.
     Returns (concept_list, raw_index_text) — raw text preserved for pass 2 context.
     """
-    concepts = []
-    seen = set()
+    concepts: list[str] = []
+    seen: set[str] = set()
+
+    def add_concept(candidate: str) -> None:
+        concept = _clean_concept_candidate(candidate)
+        if concept and concept not in seen:
+            concepts.append(concept)
+            seen.add(concept)
+
+    lines = raw.splitlines()
     in_concepts = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
 
-    for line in raw.splitlines():
-        line = line.strip()
-        if line.startswith("CONCEPTS:"):
+        heading = _normalize_heading(stripped)
+        if _is_concepts_heading(heading):
             in_concepts = True
-            continue
-        if line.startswith("RELATIONSHIPS:"):
-            break
-        if not in_concepts or not line:
+            # Handle inline style: "CONCEPTS: RSA, AES, ..."
+            if ":" in heading:
+                inline = heading.split(":", 1)[1].strip()
+                for part in re.split(r"[,;|]", inline):
+                    add_concept(part)
             continue
 
-        match = re.match(r'^(?:\d+\.|[-*])\s+(.+?)(?:\s+[—–-]\s+.+)?$', line)
-        if match:
-            concept = match.group(1).strip()
-            if concept not in seen:
-                concepts.append(concept)
-                seen.add(concept)
+        if in_concepts and _is_relationships_heading(heading):
+            break
+
+        if in_concepts:
+            add_concept(stripped)
+
+    # Fallback: parse all bullet/numbered lines if no explicit concepts section
+    if not concepts:
+        for line in lines:
+            if re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
+                add_concept(line)
 
     return concepts, raw
+
+
+def _normalize_heading(line: str) -> str:
+    """Normalize markdown-heavy heading lines for robust section matching."""
+    normalized = re.sub(r"^[>#\-*\s]+", "", line.strip())
+    return normalized.strip("*").strip()
+
+
+def _is_concepts_heading(line: str) -> bool:
+    line = line.lower()
+    return bool(re.match(r"^(concepts?|key concepts?|topics?)\s*:?.*$", line))
+
+
+def _is_relationships_heading(line: str) -> bool:
+    line = line.lower()
+    return bool(re.match(r"^(relationships?|links?)\s*:?.*$", line))
+
+
+def _clean_concept_candidate(text: str) -> str:
+    """Extract a concept name from a noisy list item line."""
+    candidate = text.strip()
+    candidate = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s+", "", candidate)
+    candidate = candidate.strip().strip("*").strip("`")
+    candidate = candidate.replace("**", "").replace("__", "")
+    candidate = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", candidate)
+
+    # Skip relationships or obvious non-concept lines.
+    if "->" in candidate or "http://" in candidate or "https://" in candidate:
+        return ""
+
+    # Keep only leading concept name before descriptions.
+    candidate = re.split(r"\s+[—–-]\s+|:\s+", candidate, maxsplit=1)[0].strip()
+
+    if not candidate:
+        return ""
+    if len(candidate) > 90 or len(candidate.split()) > 12:
+        return ""
+    if re.fullmatch(r"[\W_0-9]+", candidate):
+        return ""
+    return candidate
 
 
 def parse_wiki_page(raw: str) -> tuple[str, str]:
@@ -154,6 +211,52 @@ def _normalize_concept(name: str) -> str:
     return re.sub(r'\s*\([^)]+\)', '', name).strip().lower()
 
 
+def _concept_tokens(name: str) -> set[str]:
+    """Tokenize a concept for overlap checks used in duplicate guards."""
+    return set(re.findall(r"[a-z0-9]+", _normalize_concept(name)))
+
+
+def _concept_aliases(name: str) -> set[str]:
+    """Generate likely aliases (short name, abbreviation, normalized form)."""
+    aliases = {_normalize_concept(name)}
+    paren_match = re.match(r'^(.+?)\s*\((.+?)\)', name)
+    if paren_match:
+        aliases.add(paren_match.group(1).strip().lower())
+        aliases.add(paren_match.group(2).strip().lower())
+    return {a for a in aliases if a}
+
+
+def _is_safe_near_duplicate(candidate: str, existing: str) -> bool:
+    """Conservative guard to prevent merging distinct concepts."""
+    norm_candidate = _normalize_concept(candidate)
+    norm_existing = _normalize_concept(existing)
+
+    if not norm_candidate or not norm_existing:
+        return False
+    if norm_candidate == norm_existing:
+        return True
+
+    alias_overlap = _concept_aliases(candidate) & _concept_aliases(existing)
+    if alias_overlap:
+        return True
+
+    candidate_tokens = _concept_tokens(candidate)
+    existing_tokens = _concept_tokens(existing)
+    overlap = candidate_tokens & existing_tokens
+    if not overlap:
+        return False
+
+    token_union = candidate_tokens | existing_tokens
+    token_jaccard = len(overlap) / max(len(token_union), 1)
+    norm_similarity = SequenceMatcher(None, norm_candidate, norm_existing).ratio()
+
+    # Prefix matches are allowed only for strong stems (e.g. "ind cpa").
+    if norm_candidate.startswith(norm_existing) or norm_existing.startswith(norm_candidate):
+        return len(min(norm_candidate, norm_existing, key=len)) >= 6
+
+    return norm_similarity >= 0.84 and token_jaccard >= 0.25
+
+
 def find_near_duplicate(concept: str, vault_pages: list[str],
                         cutoff: float = 0.82) -> str | None:
     """
@@ -166,7 +269,7 @@ def find_near_duplicate(concept: str, vault_pages: list[str],
     """
     # Pass 1: raw match
     close = get_close_matches(concept, vault_pages, n=1, cutoff=cutoff)
-    if close:
+    if close and _is_safe_near_duplicate(concept, close[0]):
         return close[0]
 
     # Pass 2: normalized match with lower cutoff
@@ -175,7 +278,9 @@ def find_near_duplicate(concept: str, vault_pages: list[str],
     close_norm = get_close_matches(norm_concept, list(norm_pages.keys()),
                                    n=1, cutoff=0.75)
     if close_norm:
-        return norm_pages[close_norm[0]]
+        candidate = norm_pages[close_norm[0]]
+        if _is_safe_near_duplicate(concept, candidate):
+            return candidate
 
     # Pass 3: prefix match — catches 'IND-CPA Security' vs 'IND-CPA (...)'
     # If the normalized concept is a prefix of a normalized vault page
@@ -183,7 +288,7 @@ def find_near_duplicate(concept: str, vault_pages: list[str],
     for norm_page, original_page in norm_pages.items():
         shorter = min(norm_concept, norm_page, key=len)
         longer  = max(norm_concept, norm_page, key=len)
-        if len(shorter) >= 6 and longer.startswith(shorter):
+        if len(shorter) >= 6 and longer.startswith(shorter) and _is_safe_near_duplicate(concept, original_page):
             return original_page
 
     return None
@@ -297,9 +402,17 @@ def detect_subject(raw_stem: str, concepts: list[str] | None = None,
     """
     # Step 1: clean filename
     cleaned = re.sub(
-        r'[_-](pptx|pdf|optimized|compressed|final|v\d+)$',
+        r'[_-](pptx|pdf|docx|doc|txt|md|optimized|compressed|final|v\d+)$',
         '', raw_stem, flags=re.IGNORECASE
     ).replace('_', ' ').replace('-', ' ').strip()
+
+    # Drop leading structural prefixes like "Unit3", "Week 4", "Chapter 2".
+    cleaned = re.sub(
+        r'^(?:week|unit|chapter|module|class|lecture|part)\s*\d+\s*',
+        '',
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
 
     first_word = cleaned.split()[0].lower() if cleaned.split() else ""
     is_generic = (
@@ -353,6 +466,55 @@ def _chapter_summary_text(chapters: list[dict]) -> str:
     return "\n\n---\n\n".join(summaries)
 
 
+def _build_index(chapters: list[dict]) -> tuple[list[str], str]:
+    """Run pass-1 indexing and return parsed concepts and raw index text."""
+    index_text_input = "\n\n---\n\n".join(ch["content"] for ch in chapters)
+    index_prompt = load_prompt("index").replace("{text}", index_text_input)
+    index_raw = query(index_prompt, max_tokens=4000)
+    concepts, index_text = parse_index(index_raw)
+    if not concepts:
+        raise ValueError(
+            "No concepts were parsed from the index response. "
+            "Check the prompt/output format before continuing."
+        )
+    return concepts, index_text
+
+
+def _get_subject(raw_stem: str, concepts: list[str], subject_override: str, batch_mode: bool) -> str:
+    if subject_override:
+        print(f"  Subject (from --subject flag): \"{subject_override}\"")
+        return subject_override
+    return detect_subject(raw_stem, concepts, batch_mode=batch_mode)
+
+
+def _collect_vault_pages(vault_state: dict) -> list[str]:
+    return [
+        page
+        for pages in vault_state["pages"].values()
+        for page in pages.keys()
+    ]
+
+
+def _distill_concept_context(
+    all_chunks: list[str],
+    concept: str,
+    concepts: list[str],
+    max_chars: int = 4000,
+) -> str:
+    """Retrieve -> dedupe/rank -> limit -> distill facts for one concept."""
+    other_concepts = [c for c in concepts if c != concept]
+    ranked_chunks = retrieve_ranked_chunks(
+        all_chunks,
+        concept=concept,
+        related_concepts=other_concepts[:5],
+        top_k=2,
+    )
+    relevant_text = limit_context(ranked_chunks, max_chars=max_chars)
+
+    facts_text = extract_facts(concept, relevant_text, max_tokens=450).strip()
+    return facts_text or relevant_text
+
+
 # --- Main pipeline ---
 
 def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batch_mode: bool = False):
@@ -376,39 +538,17 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
     # For flashcards/cheatsheet: compressed summary (first chunk per chapter)
     summary_text = _chapter_summary_text(chapters)
 
-    # For index: full text so no concepts get dropped
-    # One API call, so cost is low even with more tokens
-    index_text_input = "\n\n---\n\n".join(ch["content"] for ch in chapters)
-
-    # 3. Build concept index — Pass 1 (one API call on full text)
+    # 3. Build concept index — Pass 1
     print("\n[3/6] Building concept index (Pass 1)...")
-    index_prompt = load_prompt("index").replace("{text}", index_text_input)
-    index_raw = query(index_prompt, max_tokens=4000)  # Haiku
-    concepts, index_text = parse_index(index_raw)
-    if not concepts:
-        raise ValueError(
-            "No concepts were parsed from the index response. "
-            "Check the prompt/output format before continuing."
-        )
+    concepts, index_text = _build_index(chapters)
     print(f"  Found {len(concepts)} concepts: {', '.join(concepts)}")
 
-    # Detect subject — uses filename first, AI inference second, prompt third
-    if subject_override:
-        subject = subject_override
-        print(f"  Subject (from --subject flag): \"{subject}\"")
-    else:
-        subject = detect_subject(raw_stem, concepts, batch_mode=batch_mode)
+    subject = _get_subject(raw_stem, concepts, subject_override, batch_mode)
 
     # 4. Generate wiki pages — Pass 2 (incremental: new / merge / skip)
     print(f"\n[4/6] Processing {len(concepts)} concepts (Pass 2)...")
     vault_state = load_vault_state(output_dir)
-    # Flat list of all existing page names across all subjects — used for
-    # cross-run fuzzy matching (catches "Kasiski" vs "Kasisky" etc.)
-    all_vault_pages = [
-        page
-        for pages in vault_state["pages"].values()
-        for page in pages.keys()
-    ]
+    all_vault_pages = _collect_vault_pages(vault_state)
     wiki_pages = {}         # new pages to write
     merged_pages = {}       # existing pages that were updated
     skipped = []            # concepts with no new content
@@ -417,14 +557,7 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
     merge_prompt_template = load_prompt("merge")
 
     for i, concept in enumerate(concepts):
-        other_concepts = [c for c in concepts if c != concept]
-        relevant_text = retrieve_chunks(
-            all_chunks,
-            concept=concept,
-            related_concepts=other_concepts[:5],
-            top_k=2,       # reduced from 3 — diminishing returns beyond 2 chunks
-            max_chars=4000 # reduced from 8000 — sweet spot for quality vs cost
-        )
+        distilled_facts = _distill_concept_context(all_chunks, concept, concepts, max_chars=4000)
 
         existing_path = find_existing_page(concept, subject, vault_state)
 
@@ -443,14 +576,13 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
         if existing_path is None:
             # NEW PAGE — generate from scratch
             print(f"  [{i+1}/{len(concepts)}] NEW: {concept} "
-                  f"({len(relevant_text):,} chars)...")
-            # Send concept names only as index — relationships add tokens without
-            # improving wikilink accuracy (concept_names already covers that)
+                  f"({len(distilled_facts):,} chars distilled)...")
             page_prompt = (wiki_prompt_template
                            .replace("{concept}", concept)
                            .replace("{index}", concept_names)
                            .replace("{concept_names}", concept_names)
-                           .replace("{text}", relevant_text))
+                           .replace("{facts}", distilled_facts)
+                           .replace("{text}", distilled_facts))
             page_raw = query(page_prompt, quality=True, max_tokens=1500)
             filename, page_content = parse_wiki_page(page_raw)
             page_content = fix_wikilinks(page_content, concepts,
@@ -467,7 +599,8 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
             merge_prompt = (merge_prompt_template
                             .replace("{existing_content}", existing_content)
                             .replace("{concept}", concept)
-                            .replace("{new_content}", relevant_text)
+                            .replace("{facts}", distilled_facts)
+                            .replace("{new_content}", distilled_facts)
                             .replace("{source}", subject)
                             .replace("{concept_names}", concept_names))
             merge_raw = query(merge_prompt, quality=True, max_tokens=800)

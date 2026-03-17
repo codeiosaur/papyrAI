@@ -194,15 +194,31 @@ def retrieve_chunks(
 
     Returns concatenated relevant chunks as a single string.
     """
+    ranked_chunks = retrieve_ranked_chunks(
+        chunks=chunks,
+        concept=concept,
+        related_concepts=related_concepts,
+        top_k=top_k,
+    )
+    return limit_context(ranked_chunks, max_chars=max_chars)
+
+
+def retrieve_ranked_chunks(
+    chunks: list[str],
+    concept: str,
+    related_concepts: list[str] = [],
+    top_k: int = 3,
+) -> list[str]:
+    """Return top-ranked relevant chunks before context-size limiting."""
     if not chunks:
-        return ""
+        return []
 
     deduped_chunks = deduplicate_chunks(chunks)
     if not deduped_chunks:
-        return ""
+        return []
 
     if len(deduped_chunks) == 1:
-        return deduped_chunks[0][:max_chars]
+        return [deduped_chunks[0]]
 
     related = related_concepts or []
 
@@ -212,10 +228,8 @@ def retrieve_chunks(
         query_terms.extend(_keywords_from_concept(related_concept))
     lexical_scores = bm25_scores(deduped_chunks, query_terms)
 
-    # Score all chunks
     scored = [
         (
-            # Hybrid rank: BM25 lexical relevance + semantic keyword weighting.
             lexical_scores[i] * 4.0 + score_chunk(chunk, concept, related),
             i,
             chunk,
@@ -224,22 +238,35 @@ def retrieve_chunks(
     ]
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # If nothing scored, fall back to first chunk
     if scored[0][0] == 0:
-        return deduped_chunks[0][:max_chars]
+        return [deduped_chunks[0]]
 
-    # Take top_k chunks, respecting max_chars budget
-    selected = []
+    return [chunk for _, _, chunk in scored[:top_k]]
+
+
+def limit_context(chunks: list[str], max_chars: int = 4000) -> str:
+    """Join chunks into a single context string under a max char budget."""
+    if not chunks:
+        return ""
+
+    separator = "\n\n---\n\n"
+    selected: list[str] = []
     total_chars = 0
 
-    for score, idx, chunk in scored[:top_k]:
-        if total_chars + len(chunk) > max_chars:
-            # Add truncated version if we have room for at least 500 chars
-            remaining = max_chars - total_chars
-            if remaining > 500:
-                selected.append(chunk[:remaining])
-            break
-        selected.append(chunk)
-        total_chars += len(chunk)
+    for chunk in chunks:
+        sep_len = len(separator) if selected else 0
+        required = sep_len + len(chunk)
 
-    return "\n\n---\n\n".join(selected)
+        if total_chars + required > max_chars:
+            remaining = max_chars - total_chars
+            # Only append a truncated chunk when there is still meaningful
+            # payload room left after accounting for a separator (if needed).
+            payload_room = remaining - sep_len
+            if payload_room > 500:
+                selected.append(chunk[:payload_room])
+            break
+
+        selected.append(chunk)
+        total_chars += required
+
+    return separator.join(selected)
