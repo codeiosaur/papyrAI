@@ -1,14 +1,22 @@
-"""
-pdf_to_notes — main entry point
-Usage: python main.py <path_to_pdf> [output_dir]
+"""pdf_to_notes main orchestration module.
 
-Pipeline:
-  1. Extract text from PDF
-  2. Split into chapters/sections
-  3. Chunk each section into context-sized pieces
-  4. Build concept index (Pass 1 — one API call)
-    5. For each concept, retrieve relevant chunks -> extract facts -> generate wiki page (Pass 2)
-  6. Generate flashcards and cheat sheet from full text
+This file contains the complete high-level workflow and most quality/safety
+guardrails. The architecture is intentionally two-pass:
+
+1) Pass 1 (index pass): ask the model for a concept list over broad content.
+2) Pass 2 (concept pass): process each concept independently (parallel-safe).
+
+Why two passes:
+- Pass 1 creates structure from noisy source text.
+- Pass 2 narrows each generation call to targeted context for better quality.
+
+Why this module is large:
+- Most production behavior is controlled here so profile tuning, dedupe,
+    skip logic, and generation retries stay visible in one place.
+
+Entry points:
+- run_cli(...): CLI interface and argument validation.
+- process_pdf(...): single-PDF pipeline execution.
 """
 
 import re
@@ -19,7 +27,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from difflib import get_close_matches, SequenceMatcher
-import time
+import time 
 
 # Allow running this file directly: `python src/pdfwiki/main.py ...`
 # by ensuring `src/` is on sys.path for `import pdfwiki...`.
@@ -53,6 +61,10 @@ REGEX_VERB = re.compile(
 )
 REGEX_MARKDOWN_LINK = re.compile(r'\[([^\]]+)\]\([^\)]+\)')
 REGEX_SOURCE_HASH = re.compile(r'<!--\s*source_context_hash:\s*([0-9a-f]{12,40})\s*-->')
+REGEX_BAD_CONCEPT_START = re.compile(
+    r'^(if|when|while|because|although|though|however|therefore|thus|whereas|unless|until)\b',
+    re.IGNORECASE,
+)
 
 
 RUN_PROFILE_ALIASES = {
@@ -64,9 +76,9 @@ RUN_PROFILE_SETTINGS: dict[str, dict[str, int]] = {
     "speed": {
         "context_max_chars": 2200,
         "extract_max_tokens": 280,
-        "write_max_tokens": 800,
-        "merge_max_tokens": 500,
-        "retrieve_top_k": 1,
+        "write_max_tokens": 1000,
+        "merge_max_tokens": 650,
+        "retrieve_top_k": 2,
         "default_max_workers": 4,
     },
     # Default tradeoff profile.
@@ -182,6 +194,13 @@ def _clean_concept_candidate(text: str) -> str:
 
     candidate = candidate.strip().rstrip(".;")
 
+    if REGEX_BAD_CONCEPT_START.match(candidate):
+        return ""
+
+    lower = candidate.lower()
+    if lower.startswith(("if an ", "if a ", "if the ", "when an ", "when a ", "when the ")):
+        return ""
+
     if not candidate:
         return ""
     if len(candidate) > 90 or len(candidate.split()) > 12:
@@ -272,7 +291,11 @@ def _normalize_concept(name: str) -> str:
     """Strip parentheticals and normalize for fuzzy comparison.
     'IND-CPA (Indistinguishability...)' → 'ind-cpa'
     """
-    return re.sub(r'\s*\([^)]+\)', '', name).strip().lower()
+    normalized = name.replace("_", " ")
+    normalized = re.sub(r'%20', ' ', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s*\([^)]+\)', '', normalized).strip().lower()
+    normalized = re.sub(r'\s+', ' ', normalized)
+    return normalized
 
 
 def _concept_tokens(name: str) -> set[str]:
@@ -290,6 +313,62 @@ def _concept_aliases(name: str) -> set[str]:
     return {a for a in aliases if a}
 
 
+def _has_modifier_conflict(norm_candidate: str, norm_existing: str) -> bool:
+    """Guard against collapsing semantically different concepts with similar roots.
+
+    Example we must keep distinct:
+    - "symmetric encryption"
+    - "asymmetric encryption"
+    """
+    c_tokens = norm_candidate.split()
+    e_tokens = norm_existing.split()
+    if len(c_tokens) < 2 or len(e_tokens) < 2:
+        return False
+
+    # Compare adjective + shared head noun pattern (e.g., "X encryption").
+    if c_tokens[-1] != e_tokens[-1]:
+        return False
+
+    c_first = c_tokens[0]
+    e_first = e_tokens[0]
+    if c_first == e_first:
+        return False
+
+    # Prefix forms often flip meaning (a-/non-), so treat as distinct.
+    if c_first == f"a{e_first}" or e_first == f"a{c_first}":
+        return True
+    if c_first == f"non{e_first}" or e_first == f"non{c_first}":
+        return True
+    return False
+
+
+def _is_token_level_typo_variant(norm_candidate: str, norm_existing: str) -> bool:
+    """Detect one-token spelling variants (e.g., Kasisky vs Kasiski)."""
+    c_tokens = norm_candidate.split()
+    e_tokens = norm_existing.split()
+    if len(c_tokens) != len(e_tokens):
+        return False
+
+    equal = 0
+    typo_pairs: list[tuple[str, str]] = []
+    for c_tok, e_tok in zip(c_tokens, e_tokens):
+        if c_tok == e_tok:
+            equal += 1
+            continue
+        typo_pairs.append((c_tok, e_tok))
+
+    if equal < max(1, len(c_tokens) - 1):
+        return False
+    if not typo_pairs:
+        return False
+
+    for c_tok, e_tok in typo_pairs:
+        sim = SequenceMatcher(None, c_tok, e_tok).ratio()
+        if sim < 0.84:
+            return False
+    return True
+
+
 def _is_safe_near_duplicate(candidate: str, existing: str) -> bool:
     """Conservative guard to prevent merging distinct concepts."""
     norm_candidate = _normalize_concept(candidate)
@@ -298,6 +377,12 @@ def _is_safe_near_duplicate(candidate: str, existing: str) -> bool:
     if not norm_candidate or not norm_existing:
         return False
     if norm_candidate == norm_existing:
+        return True
+
+    if _has_modifier_conflict(norm_candidate, norm_existing):
+        return False
+
+    if _is_token_level_typo_variant(norm_candidate, norm_existing):
         return True
 
     alias_overlap = _concept_aliases(candidate) & _concept_aliases(existing)
@@ -318,7 +403,8 @@ def _is_safe_near_duplicate(candidate: str, existing: str) -> bool:
     if norm_candidate.startswith(norm_existing) or norm_existing.startswith(norm_candidate):
         return len(min(norm_candidate, norm_existing, key=len)) >= 6
 
-    return norm_similarity >= 0.84 and token_jaccard >= 0.25
+    # Require stronger overlap to avoid collapsing related-but-distinct concepts.
+    return norm_similarity >= 0.9 and token_jaccard >= 0.4
 
 
 def find_near_duplicate(concept: str, vault_pages: list[str],
@@ -356,6 +442,21 @@ def find_near_duplicate(concept: str, vault_pages: list[str],
             return original_page
 
     return None
+
+
+def _dedupe_concepts_for_run(concepts: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Dedupe near-identical concept names within the same run."""
+    kept: list[str] = []
+    dropped_pairs: list[tuple[str, str]] = []
+
+    for concept in concepts:
+        duplicate_of = find_near_duplicate(concept, kept, cutoff=0.9) if kept else None
+        if duplicate_of and _is_safe_near_duplicate(concept, duplicate_of):
+            dropped_pairs.append((concept, duplicate_of))
+            continue
+        kept.append(concept)
+
+    return kept, dropped_pairs
 
 
 def add_frontmatter(filename: str, content: str, concepts: list[str],
@@ -574,6 +675,59 @@ def _chapter_summary_text(chapters: list[dict]) -> str:
     return "\n\n---\n\n".join(summaries)
 
 
+def _concept_has_source_evidence(concept: str, chunks: list[str]) -> bool:
+    """Require concept-like evidence in extracted text to reduce hallucinated pages."""
+    if not chunks:
+        return False
+
+    aliases = {concept.lower()}
+    paren_match = REGEX_PAREN.match(concept)
+    if paren_match:
+        aliases.add(paren_match.group(1).strip().lower())
+        aliases.add(paren_match.group(2).strip().lower())
+
+    for chunk in chunks:
+        chunk_l = chunk.lower()
+        if any(alias and alias in chunk_l for alias in aliases):
+            return True
+
+    # Fallback token evidence for titles without direct phrase match.
+    tokens = [t for t in re.findall(r"[a-z0-9]+", concept.lower()) if len(t) >= 4]
+    if not tokens:
+        return False
+
+    for chunk in chunks:
+        chunk_l = chunk.lower()
+        hits = sum(1 for t in tokens if t in chunk_l)
+        if hits >= min(2, len(tokens)):
+            return True
+
+    return False
+
+
+def _filter_concepts_with_evidence(concepts: list[str], chunks: list[str]) -> tuple[list[str], list[str]]:
+    """Filter concepts that lack source evidence, with a low-signal fallback.
+
+    In sparse or synthetic inputs (for example offline test stubs), strict
+    evidence checks can drop every concept and produce empty output. When less
+    than half of concepts have evidence, we treat the signal as unreliable and
+    return the original concept list unchanged.
+    """
+    kept: list[str] = []
+    dropped: list[str] = []
+    for concept in concepts:
+        if _concept_has_source_evidence(concept, chunks):
+            kept.append(concept)
+        else:
+            dropped.append(concept)
+
+    # Low-signal fallback: do not gate generation on weak evidence extraction.
+    if concepts and (not kept or (len(kept) / len(concepts)) < 0.5):
+        return concepts, []
+
+    return kept, dropped
+
+
 def _context_hash(text: str) -> str:
     """Short stable hash used to skip unchanged merge generations."""
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
@@ -634,8 +788,43 @@ def _postprocess_generated_content(content: str) -> str:
     return fixed
 
 
+def _looks_incomplete_output(text: str) -> bool:
+    """Detect likely token-cut/truncated markdown outputs."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if REGEX_WIKILINK.search(stripped) and stripped.count("[[") != stripped.count("]]"):
+        return True
+    if stripped.count("```") % 2 != 0:
+        return True
+    if stripped.endswith(("[[", "[", "(`", "(", " -", " :", " Al")):
+        return True
+    return False
+
+
+def _query_with_quality_retry(prompt: str, max_tokens: int, task: str = "write") -> str:
+    """Retry once with more tokens if first output appears truncated."""
+    first = query(prompt, task=task, max_tokens=max_tokens)
+    if not _looks_incomplete_output(first):
+        return first
+
+    retry_prompt = (
+        prompt
+        + "\n\nIMPORTANT: Return COMPLETE markdown only. Close all [[wikilinks]] and code fences."
+    )
+    return query(retry_prompt, task=task, max_tokens=max(int(max_tokens * 1.35), max_tokens + 200))
+
+
 def _build_index(chapters: list[dict]) -> tuple[list[str], str]:
-    """Run pass-1 indexing and return parsed concepts and raw index text."""
+    """Run Pass 1 indexing and return parsed concept names plus raw model output.
+
+    Inputs are chapter-level text blocks joined into one index prompt. We keep the
+    raw index text because downstream steps (for example MOC relationship hints)
+    may still need unparsed context.
+
+    Raises:
+        ValueError: when no valid concepts survive parsing/cleanup.
+    """
     index_text_input = "\n\n---\n\n".join(ch["content"] for ch in chapters)
     index_prompt = load_prompt("index").replace("{text}", index_text_input)
     index_raw = query(index_prompt, task="cheap", max_tokens=4000)
@@ -663,16 +852,23 @@ def _collect_vault_pages(vault_state: dict) -> list[str]:
     ]
 
 
-def _distill_concept_context(
+def _retrieve_concept_context(
     all_chunks: list[str],
     concept: str,
     concepts: list[str],
     max_chars: int = 4000,
     retrieve_top_k: int = 2,
-    extract_max_tokens: int = 450,
-    skip_extract_min_chars: int = 1400,
-) -> tuple[str, str, bool]:
-    """Retrieve -> dedupe/rank -> adaptive sizing -> distill facts for one concept."""
+) -> str:
+    """Build per-concept retrieval context used by generation.
+
+    Pipeline inside this helper:
+    1) rank chunks with lexical + heuristic scoring,
+    2) adapt context size based on confidence score,
+    3) enforce character budget with deterministic truncation.
+
+    This helper is intentionally side-effect free so it is safe to call in
+    parallel worker threads.
+    """
     other_concepts = [c for c in concepts if c != concept]
     
     # Get ranked chunks with scores for intelligent context sizing
@@ -694,21 +890,46 @@ def _distill_concept_context(
         adaptive_max_chars = max_chars
     
     ranked_chunks = [chunk for chunk, _ in ranked_with_scores]
-    relevant_text = limit_context(ranked_chunks, max_chars=adaptive_max_chars)
+    return limit_context(ranked_chunks, max_chars=adaptive_max_chars)
+
+
+def _distill_concept_context(
+    concept: str,
+    relevant_text: str,
+    extract_max_tokens: int = 450,
+    skip_extract_min_chars: int = 900,
+) -> tuple[str, bool]:
+    """Optionally distill facts from retrieved context.
+
+    Returns:
+        tuple[str, bool]:
+            - distilled text to feed writer/merge prompts
+            - whether extraction was skipped
+
+    Skip behavior:
+    - very short contexts skip extraction to save latency and avoid over-
+      compressing already concise evidence.
+    """
 
     # Fast path: short contexts don't benefit much from another model pass.
     if len(relevant_text) < skip_extract_min_chars:
-        return relevant_text, relevant_text, True
+        return relevant_text, True
 
     facts_text = extract_facts(concept, relevant_text, max_tokens=extract_max_tokens).strip()
     distilled = facts_text or relevant_text
-    return distilled, relevant_text, not bool(facts_text)
+    return distilled, not bool(facts_text)
 
 
 # --- Main pipeline ---
 
 def _resolve_run_profile(profile: str | None) -> tuple[str, dict[str, int]]:
-    """Resolve run profile from arg/env/default and return profile name + settings."""
+    """Resolve run profile from CLI arg/env/default.
+
+    Precedence:
+    1) explicit function argument
+    2) PDF_TO_NOTES_PROFILE env var
+    3) hardcoded default ('hybrid')
+    """
     raw = (profile or os.environ.get("PDF_TO_NOTES_PROFILE", "hybrid")).strip().lower()
     normalized = RUN_PROFILE_ALIASES.get(raw, raw)
     if normalized not in RUN_PROFILE_SETTINGS:
@@ -718,7 +939,13 @@ def _resolve_run_profile(profile: str | None) -> tuple[str, dict[str, int]]:
 
 
 def _resolve_max_workers(max_workers: int | None, default_workers: int) -> int:
-    """Resolve concept-processing worker count from arg/env/default."""
+    """Resolve concept-processing worker count from arg/env/default.
+
+    Precedence:
+    1) explicit CLI value
+    2) PDF_TO_NOTES_MAX_WORKERS env var
+    3) profile-derived default
+    """
     if max_workers is not None:
         return max(1, int(max_workers))
 
@@ -740,6 +967,21 @@ def process_pdf(
     max_workers: int | None = None,
     profile: str | None = None,
 ):
+    """Run the full PDF-to-vault pipeline for one PDF.
+
+    High-level stages:
+    1) text extraction and smart chunking
+    2) concept indexing + quality filters
+    3) per-concept generation/merge (parallel)
+    4) MOC refresh (only when new pages are created)
+    5) flashcards and cheatsheet generation
+
+    Determinism and safety notes:
+    - per-concept work runs in parallel but results are applied in original
+      concept order to keep output stable across runs.
+    - each concept is isolated; failures are recorded and do not stop others.
+    - unchanged existing pages are skipped via source-context hash.
+    """
     raw_stem = Path(pdf_path).stem
     print(f"\n{'='*50}", flush=True)
     print(f"Processing: {raw_stem}", flush=True)
@@ -773,6 +1015,20 @@ def process_pdf(
     # 3. Build concept index — Pass 1
     print("\n[3/6] Building concept index (Pass 1)...", flush=True)
     concepts, index_text = _build_index(chapters)
+    concepts, dropped_concepts = _filter_concepts_with_evidence(concepts, all_chunks)
+    if dropped_concepts:
+        print(
+            f"  [quality] dropped {len(dropped_concepts)} low-evidence concepts: "
+            + ", ".join(dropped_concepts[:8])
+            + ("..." if len(dropped_concepts) > 8 else ""),
+            flush=True,
+        )
+    concepts, deduped_pairs = _dedupe_concepts_for_run(concepts)
+    if deduped_pairs:
+        preview = ", ".join(f"{c} -> {k}" for c, k in deduped_pairs[:8])
+        if len(deduped_pairs) > 8:
+            preview += ", ..."
+        print(f"  [quality] deduped {len(deduped_pairs)} near-duplicate concepts: {preview}", flush=True)
     print(f"  Found {len(concepts)} concepts: {', '.join(concepts)}", flush=True)
 
     subject = _get_subject(raw_stem, concepts, subject_override, batch_mode)
@@ -792,16 +1048,21 @@ def process_pdf(
     concept_names = "\n".join(f"- {c}" for c in concepts)
     wiki_prompt_template = load_prompt("wiki")
     merge_prompt_template = load_prompt("merge")
+    if profile_name == "speed":
+        wiki_prompt_template += "\n\nAdditional constraints for speed profile:\n- Do NOT generate Mermaid diagrams.\n- Prefer plain markdown sections and bullets."
 
     def _process_single_concept(i: int, concept: str) -> dict:
-        """Run pass-2 processing for one concept in isolation."""
-        distilled_facts, retrieved_context, extraction_skipped = _distill_concept_context(
+        """Run Pass 2 processing for one concept in isolation.
+
+        The helper intentionally returns structured metadata so the caller can
+        preserve deterministic write order after futures complete out-of-order.
+        """
+        retrieved_context = _retrieve_concept_context(
             all_chunks,
             concept,
             concepts,
             max_chars=profile_settings["context_max_chars"],
             retrieve_top_k=profile_settings["retrieve_top_k"],
-            extract_max_tokens=profile_settings["extract_max_tokens"],
         )
         source_hash = _context_hash(retrieved_context)
         existing_path = find_existing_page(concept, subject, vault_state)
@@ -816,6 +1077,29 @@ def process_pdf(
                 if near_dup in subject_pages:
                     existing_path = subject_pages[near_dup]
 
+        # Existing-page path: check hash match first so reruns can skip early
+        # before expensive extraction/write calls.
+        existing_content = ""
+        if existing_path is not None:
+            existing_content = Path(existing_path).read_text(encoding="utf-8")
+            existing_hash = _extract_source_hash(existing_content)
+            if existing_hash == source_hash:
+                return {
+                    "index": i,
+                    "concept": concept,
+                    "kind": "skip",
+                    "near_dup": near_dup,
+                    "existing_path": existing_path,
+                    "reason": "source-hash-match",
+                }
+
+        # Distillation runs only after skip checks, minimizing unnecessary calls.
+        distilled_facts, extraction_skipped = _distill_concept_context(
+            concept,
+            retrieved_context,
+            extract_max_tokens=profile_settings["extract_max_tokens"],
+        )
+
         if existing_path is None:
             page_prompt = (wiki_prompt_template
                            .replace("{concept}", concept)
@@ -823,12 +1107,12 @@ def process_pdf(
                            .replace("{concept_names}", concept_names)
                            .replace("{facts}", distilled_facts)
                            .replace("{text}", distilled_facts))
-            page_raw = query(
+            page_raw = _query_with_quality_retry(
                 page_prompt,
-                task="write",
                 max_tokens=profile_settings["write_max_tokens"],
+                task="write",
             )
-            filename, page_content = parse_wiki_page(page_raw)
+            _, page_content = parse_wiki_page(page_raw)
             page_content = fix_wikilinks(page_content, concepts,
                                          vault_pages=all_vault_pages)
             graph_related = set(concept_graph.get(concept, set()))
@@ -836,30 +1120,19 @@ def process_pdf(
             active_related = sorted((graph_related | content_related) - {concept})
             page_content = inject_active_wikilinks(page_content, active_related, concepts)
             page_content = _postprocess_generated_content(page_content)
-            page_content = add_frontmatter(filename, page_content, concepts,
+            page_content = fix_wikilinks(page_content, concepts,
+                                         vault_pages=all_vault_pages)
+            page_content = add_frontmatter(concept, page_content, concepts,
                                            subject=subject)
-            page_content = _upsert_source_hash_marker(page_content, source_hash)
             return {
                 "index": i,
                 "concept": concept,
                 "kind": "new",
                 "near_dup": near_dup,
                 "distilled_len": len(distilled_facts),
-                "filename": filename,
+                "filename": concept,
                 "content": page_content,
                 "reason": "extract-skipped" if extraction_skipped else "generated",
-            }
-
-        existing_content = Path(existing_path).read_text(encoding="utf-8")
-        existing_hash = _extract_source_hash(existing_content)
-        if existing_hash == source_hash:
-            return {
-                "index": i,
-                "concept": concept,
-                "kind": "skip",
-                "near_dup": near_dup,
-                "existing_path": existing_path,
-                "reason": "source-hash-match",
             }
 
         merge_prompt = (merge_prompt_template
@@ -869,10 +1142,10 @@ def process_pdf(
                         .replace("{new_content}", distilled_facts)
                         .replace("{source}", subject)
                         .replace("{concept_names}", concept_names))
-        merge_raw = query(
+        merge_raw = _query_with_quality_retry(
             merge_prompt,
-            task="write",
             max_tokens=profile_settings["merge_max_tokens"],
+            task="write",
         )
 
         if merge_raw.strip() == "NO_UPDATE":
@@ -892,6 +1165,8 @@ def process_pdf(
         active_related = sorted((graph_related | content_related) - {concept})
         merge_raw = inject_active_wikilinks(merge_raw, active_related, concepts)
         merge_raw = _postprocess_generated_content(merge_raw)
+        merge_raw = fix_wikilinks(merge_raw, concepts,
+                      vault_pages=all_vault_pages)
         merge_raw = _upsert_source_hash_marker(merge_raw, source_hash)
         return {
             "index": i,
@@ -1011,6 +1286,12 @@ def process_pdf(
 
 
 def run_cli(argv: list[str] | None = None) -> int:
+    """CLI entrypoint used by both direct execution and tests.
+
+    Returns process-style exit code:
+    - 0 on success
+    - nonzero on argument/runtime errors
+    """
     parser = argparse.ArgumentParser(
         description="Generate Obsidian wiki, flashcards, and cheatsheet from PDFs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

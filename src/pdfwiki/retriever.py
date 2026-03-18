@@ -1,6 +1,12 @@
-"""
-Chunk retrieval module.
-Scores text chunks by relevance to a concept using keyword matching.
+"""Chunk retrieval and ranking utilities.
+
+This module is the lexical retrieval layer used by Pass 2 concept generation.
+It deliberately avoids embedding dependencies for portability and speed.
+
+Core responsibilities:
+- remove near-duplicate chunks from chunking overlap,
+- score candidate chunks against a target concept,
+- produce bounded context strings for downstream prompting.
 """
 
 import re
@@ -13,7 +19,12 @@ _DEDUP_CACHE: dict[str, list[str]] = {}
 
 
 def _chunks_cache_key(chunks: list[str]) -> str:
-    """Generate a cache key based on chunk hashes."""
+    """Generate a stable key for dedupe cache lookup.
+
+    We hash only the first N chunks for speed; this is sufficient because input
+    chunk order is deterministic in this pipeline and near-duplicate detection is
+    a best-effort optimization (not correctness-critical).
+    """
     content_hash = hashlib.md5(
         "\n".join(chunks[:100]).encode()  # Hash first 100 chunks for speed
     ).hexdigest()
@@ -36,7 +47,10 @@ def deduplicate_chunks(
     This primarily catches overlap artifacts introduced by chunking,
     where adjacent chunks can share large repeated spans.
     
-    Uses a cache to avoid recomputing expensive Jaccard comparisons.
+    Uses a cache to avoid recomputing expensive pairwise Jaccard comparisons.
+
+    Complexity (worst case without cache): roughly O(n^2) comparisons over
+    normalized chunk representations.
     """
     # Check cache first
     cache_key = _chunks_cache_key(chunks)
@@ -116,6 +130,10 @@ def bm25_scores(
     Compute BM25 relevance score for each chunk against query terms.
 
     Returns a score list aligned with input chunk order.
+
+    Notes:
+    - Query terms can contain phrases; they are tokenized into BM25 terms.
+    - Output scores are combined later with heuristic density scoring.
     """
     if not chunks:
         return []
@@ -250,6 +268,13 @@ def retrieve_ranked_chunks_with_scores(
     """Return top-ranked relevant chunks with their relevance scores.
     
     Returns list of (chunk, score) tuples sorted by score descending.
+
+    Ranking formula:
+    - lexical BM25 component (weighted)
+    - heuristic semantic-ish component from score_chunk(...)
+
+    The weighted blend is intentionally simple and deterministic, which makes
+    retrieval behavior debuggable without model calls.
     """
     if not chunks:
         return []
@@ -298,8 +323,15 @@ def _compute_adaptive_context_size(
     High score (tight signal) → smaller context needed
     Low score (weak signal) → larger context for quality
     
-    avg_score: average BM25 relevance score (higher = better match)
-    base_max_chars: default context size from profile
+    avg_score: average blended retrieval score (higher = better match)
+    base_max_chars: profile-derived context budget
+
+    Behavior:
+    - strong match => shrink context toward min_factor * base
+    - weak match   => expand context toward max_factor * base
+
+    This keeps generation fast on obvious concepts while preserving coverage on
+    weakly matched concepts.
     """
     base = max(1200, int(base_max_chars))
     min_chars = max(1000, int(base * min_factor))
@@ -315,7 +347,12 @@ def _compute_adaptive_context_size(
 
 
 def limit_context(chunks: list[str], max_chars: int = 4000) -> str:
-    """Join chunks into a single context string under a max char budget."""
+    """Join ranked chunks into a bounded context string.
+
+    The function preserves ranked order and may truncate only the final chunk if
+    there is meaningful room left, which avoids wasting most of the remaining
+    budget on separators.
+    """
     if not chunks:
         return ""
 
@@ -342,6 +379,7 @@ def limit_context(chunks: list[str], max_chars: int = 4000) -> str:
     return separator.join(selected)
 
 def find_related_concepts(text: str, concept_names: list[str]) -> list[str]:
+    """Return concepts that appear verbatim in text (case-insensitive)."""
     found = set()
     text_lower = text.lower()
 
@@ -352,6 +390,11 @@ def find_related_concepts(text: str, concept_names: list[str]) -> list[str]:
     return list(found)
 
 def build_concept_graph(concepts: list[str], chunks: list[str]) -> dict:
+    """Build a simple co-occurrence graph from chunk-level concept mentions.
+
+    Graph edges are undirected in practice (stored as adjacency sets in each
+    direction), and used for active wikilink suggestions during page generation.
+    """
     graph = {c: set() for c in concepts}
 
     for chunk in chunks:

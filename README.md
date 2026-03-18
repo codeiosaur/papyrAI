@@ -23,6 +23,13 @@ Chunk retrieval
  ↓
 Wiki generation
 
+## Documentation
+
+- Inline architecture docs and docstrings:
+	- `src/pdfwiki/main.py` (pipeline orchestration, quality guards, dedupe/skip logic)
+	- `src/pdfwiki/retriever.py` (ranking, adaptive context sizing, chunk dedupe)
+- Parsing and dedupe regression coverage: `tests/test_main_parsing.py`
+
 ## Models Supported
 
 This works with the Anthropic API, as well as with any OpenAI-compatible inference endpoint.

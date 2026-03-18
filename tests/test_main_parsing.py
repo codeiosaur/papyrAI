@@ -75,6 +75,61 @@ RELATIONSHIPS:
     assert concepts == ["RSA", "Diffie-Hellman Key Exchange"]
 
 
+def test_parse_index_drops_clause_style_non_concepts():
+    raw = """
+CONCEPTS:
+- If an algorithm is deterministic, it may leak patterns.
+- Cipher Block Chaining (CBC) Mode
+RELATIONSHIPS:
+- CBC -> IND-CPA Security
+""".strip()
+
+    concepts, _ = main.parse_index(raw)
+
+    assert concepts == ["Cipher Block Chaining (CBC) Mode"]
+
+
+def test_filter_concepts_with_evidence_removes_hallucinated_item():
+    chunks = [
+        "CBC mode uses a random IV and improves security over ECB.",
+        "Collision resistance is a property of cryptographic hash functions.",
+    ]
+    concepts = ["Collision Resistance", "Chaocipher"]
+
+    kept, dropped = main._filter_concepts_with_evidence(concepts, chunks)
+
+    assert "Collision Resistance" in kept
+    assert "Chaocipher" in dropped
+
+
+def test_normalize_concept_handles_underscored_titles():
+    assert main._normalize_concept("AES_(Advanced_Encryption_Standard)") == "aes"
+
+
+def test_dedupe_concepts_for_run_collapses_near_duplicates():
+    concepts = [
+        "AES (Advanced Encryption Standard)",
+        "AES_(Advanced_Encryption_Standard)",
+    ]
+
+    kept, dropped = main._dedupe_concepts_for_run(concepts)
+
+    assert kept == ["AES (Advanced Encryption Standard)"]
+    assert dropped == [("AES_(Advanced_Encryption_Standard)", "AES (Advanced Encryption Standard)")]
+
+
+def test_dedupe_concepts_for_run_keeps_symmetric_and_asymmetric_distinct():
+    concepts = [
+        "Symmetric Encryption",
+        "Asymmetric Encryption",
+    ]
+
+    kept, dropped = main._dedupe_concepts_for_run(concepts)
+
+    assert kept == concepts
+    assert dropped == []
+
+
 def test_parse_wiki_page_uses_filename_header_when_present():
     raw = """FILENAME: RSA (Rivest-Shamir-Adleman)
 ## RSA (Rivest-Shamir-Adleman)
