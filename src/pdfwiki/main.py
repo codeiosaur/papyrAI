@@ -12,10 +12,13 @@ Pipeline:
 """
 
 import re
+import os
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from difflib import get_close_matches, SequenceMatcher
+import time
 
 # Allow running this file directly: `python src/pdfwiki/main.py ...`
 # by ensuring `src/` is on sys.path for `import pdfwiki...`.
@@ -25,7 +28,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(src_root))
 
 from pdfwiki.extractor import extract_text, split_into_chapters, chunk_text, chunk_by_page, smart_chunk
-from pdfwiki.retriever import retrieve_chunks, retrieve_ranked_chunks, limit_context, find_related_concepts, build_concept_graph
+from pdfwiki.retriever import retrieve_chunks, retrieve_ranked_chunks, retrieve_ranked_chunks_with_scores, limit_context, find_related_concepts, build_concept_graph, _compute_adaptive_context_size
 from pdfwiki.ai_client import query, extract_facts, set_provider, get_provider
 from pdfwiki.writer import write_wiki, write_flashcards, write_cheatsheet
 from pdfwiki.vault import load_vault_state, find_existing_page
@@ -34,6 +37,55 @@ from pdfwiki.vault import load_vault_state, find_existing_page
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 if not PROMPTS_DIR.exists():
     PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+# --- Precompiled regex patterns for performance (avoid recompilation) ---
+REGEX_BULLET = re.compile(r'^\s*(?:[-*•]|\d+[.)])\s+')
+REGEX_FILENAME = re.compile(r'^\*{0,2}FILENAME:\*{0,2}\s*(.+?)\*{0,2}$', re.MULTILINE)
+REGEX_HEADING = re.compile(r'^##\s+(.+)$', re.MULTILINE)
+REGEX_WIKILINK = re.compile(r'\[\[([^\]]+)\]\]')
+REGEX_CONCEPTS_HEADING = re.compile(r'^(concepts?|key concepts?|topics?)\s*:?.*$', re.IGNORECASE)
+REGEX_RELATIONSHIPS_HEADING = re.compile(r'^(relationships?|links?)\s*:?.*$', re.IGNORECASE)
+REGEX_PAREN = re.compile(r'^(.+?)\s*\((.+?)\)')
+REGEX_VERB = re.compile(
+    r'\b(depends on|is|are|means|refers to|involves|uses|requires|allows|provides|ensures)\b',
+    re.IGNORECASE,
+)
+REGEX_MARKDOWN_LINK = re.compile(r'\[([^\]]+)\]\([^\)]+\)')
+
+
+RUN_PROFILE_ALIASES = {
+    "balanced": "hybrid",
+}
+
+RUN_PROFILE_SETTINGS: dict[str, dict[str, int]] = {
+    # Fastest local iteration for most machines.
+    "speed": {
+        "context_max_chars": 2200,
+        "extract_max_tokens": 280,
+        "write_max_tokens": 800,
+        "merge_max_tokens": 500,
+        "retrieve_top_k": 1,
+        "default_max_workers": 3,
+    },
+    # Default tradeoff profile.
+    "hybrid": {
+        "context_max_chars": 3000,
+        "extract_max_tokens": 360,
+        "write_max_tokens": 1000,
+        "merge_max_tokens": 700,
+        "retrieve_top_k": 2,
+        "default_max_workers": 2,
+    },
+    # Highest quality, slower throughput.
+    "quality": {
+        "context_max_chars": 4800,
+        "extract_max_tokens": 550,
+        "write_max_tokens": 1400,
+        "merge_max_tokens": 900,
+        "retrieve_top_k": 3,
+        "default_max_workers": 1,
+    },
+}
 
 def load_prompt(name: str) -> str:
     return (PROMPTS_DIR / f"{name}.txt").read_text(encoding="utf-8")
@@ -81,7 +133,7 @@ def parse_index(raw: str) -> tuple[list[str], str]:
     # Fallback: parse all bullet/numbered lines if no explicit concepts section
     if not concepts:
         for line in lines:
-            if re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
+            if REGEX_BULLET.match(line):
                 add_concept(line)
 
     return concepts, raw
@@ -94,22 +146,20 @@ def _normalize_heading(line: str) -> str:
 
 
 def _is_concepts_heading(line: str) -> bool:
-    line = line.lower()
-    return bool(re.match(r"^(concepts?|key concepts?|topics?)\s*:?.*$", line))
+    return bool(REGEX_CONCEPTS_HEADING.match(line))
 
 
 def _is_relationships_heading(line: str) -> bool:
-    line = line.lower()
-    return bool(re.match(r"^(relationships?|links?)\s*:?.*$", line))
+    return bool(REGEX_RELATIONSHIPS_HEADING.match(line))
 
 
 def _clean_concept_candidate(text: str) -> str:
     """Extract a concept name from a noisy list item line."""
     candidate = text.strip()
-    candidate = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s+", "", candidate)
+    candidate = REGEX_BULLET.sub("", candidate)
     candidate = candidate.strip().strip("*").strip("`")
     candidate = candidate.replace("**", "").replace("__", "")
-    candidate = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", candidate)
+    candidate = REGEX_MARKDOWN_LINK.sub(r"\1", candidate)
 
     # Skip relationships or obvious non-concept lines.
     if "->" in candidate or "http://" in candidate or "https://" in candidate:
@@ -117,6 +167,18 @@ def _clean_concept_candidate(text: str) -> str:
 
     # Keep only leading concept name before descriptions.
     candidate = re.split(r"\s+[—–-]\s+|:\s+", candidate, maxsplit=1)[0].strip()
+
+    # Some model outputs include full explanatory sentences in the concept list.
+    # Trim these to the leading concept phrase when possible.
+    sentence_verb = REGEX_VERB.search(candidate)
+    if sentence_verb and len(candidate.split()) >= 4:
+        leading = candidate[:sentence_verb.start()].strip(" ,;:-")
+        if leading and len(leading.split()) <= 6:
+            candidate = leading
+        else:
+            return ""
+
+    candidate = candidate.strip().rstrip(".;")
 
     if not candidate:
         return ""
@@ -129,13 +191,13 @@ def _clean_concept_candidate(text: str) -> str:
 
 def parse_wiki_page(raw: str) -> tuple[str, str]:
     """Parse a single wiki page response into (filename, content)."""
-    match = re.search(r'^\*{0,2}FILENAME:\*{0,2}\s*(.+?)\*{0,2}$', raw, re.MULTILINE)
+    match = REGEX_FILENAME.search(raw)
     if match:
         filename = match.group(1).strip()
         content = raw[match.end():].strip()
         return filename, content
 
-    heading = re.search(r'^##\s+(.+)$', raw, re.MULTILINE)
+    heading = REGEX_HEADING.search(raw)
     if heading:
         return heading.group(1).strip(), raw
 
@@ -200,7 +262,7 @@ def fix_wikilinks(content: str, concepts: list[str],
         # No match found — leave as-is
         return match.group(0)
 
-    fixed = re.sub(r'\[\[([^\]]+)\]\]', fix_link, content)
+    fixed = REGEX_WIKILINK.sub(fix_link, content)
     return fixed
 
 
@@ -544,57 +606,116 @@ def _distill_concept_context(
     concept: str,
     concepts: list[str],
     max_chars: int = 4000,
+    retrieve_top_k: int = 2,
+    extract_max_tokens: int = 450,
 ) -> str:
-    """Retrieve -> dedupe/rank -> limit -> distill facts for one concept."""
+    """Retrieve -> dedupe/rank -> adaptive sizing -> distill facts for one concept."""
     other_concepts = [c for c in concepts if c != concept]
-    ranked_chunks = retrieve_ranked_chunks(
+    
+    # Get ranked chunks with scores for intelligent context sizing
+    ranked_with_scores = retrieve_ranked_chunks_with_scores(
         all_chunks,
         concept=concept,
         related_concepts=other_concepts[:5],
-        top_k=2,
+        top_k=retrieve_top_k,
     )
-    relevant_text = limit_context(ranked_chunks, max_chars=max_chars)
+    
+    # Calculate average relevance score to adjust context size
+    if ranked_with_scores:
+        avg_score = sum(score for _, score in ranked_with_scores) / len(ranked_with_scores)
+        adaptive_max_chars = _compute_adaptive_context_size(
+            avg_score=avg_score,
+            base_max_chars=max_chars,
+        )
+    else:
+        adaptive_max_chars = max_chars
+    
+    ranked_chunks = [chunk for chunk, _ in ranked_with_scores]
+    relevant_text = limit_context(ranked_chunks, max_chars=adaptive_max_chars)
 
-    facts_text = extract_facts(concept, relevant_text, max_tokens=450).strip()
+    facts_text = extract_facts(concept, relevant_text, max_tokens=extract_max_tokens).strip()
     return facts_text or relevant_text
 
 
 # --- Main pipeline ---
 
-def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batch_mode: bool = False):
+def _resolve_run_profile(profile: str | None) -> tuple[str, dict[str, int]]:
+    """Resolve run profile from arg/env/default and return profile name + settings."""
+    raw = (profile or os.environ.get("PDF_TO_NOTES_PROFILE", "hybrid")).strip().lower()
+    normalized = RUN_PROFILE_ALIASES.get(raw, raw)
+    if normalized not in RUN_PROFILE_SETTINGS:
+        print(f"  [warn] invalid profile {raw!r}; using 'hybrid'", flush=True)
+        normalized = "hybrid"
+    return normalized, RUN_PROFILE_SETTINGS[normalized]
+
+
+def _resolve_max_workers(max_workers: int | None, default_workers: int) -> int:
+    """Resolve concept-processing worker count from arg/env/default."""
+    if max_workers is not None:
+        return max(1, int(max_workers))
+
+    env_raw = os.environ.get("PDF_TO_NOTES_MAX_WORKERS", "").strip()
+    if env_raw:
+        try:
+            return max(1, int(env_raw))
+        except ValueError:
+            print(f"  [warn] invalid PDF_TO_NOTES_MAX_WORKERS={env_raw!r}; using default", flush=True)
+
+    return max(1, default_workers)
+
+
+def process_pdf(
+    pdf_path: str,
+    output_dir: str,
+    subject_override: str = "",
+    batch_mode: bool = False,
+    max_workers: int | None = None,
+    profile: str | None = None,
+):
     raw_stem = Path(pdf_path).stem
-    print(f"\n{'='*50}")
-    print(f"Processing: {raw_stem}")
-    print(f"{'='*50}")
+    print(f"\n{'='*50}", flush=True)
+    print(f"Processing: {raw_stem}", flush=True)
+    print(f"{'='*50}", flush=True)
 
     # 1. Extract text
-    print("\n[1/6] Extracting text from PDF...")
+    print("\n[1/6] Extracting text from PDF...", flush=True)
     full_text = extract_text(pdf_path)
 
+    profile_name, profile_settings = _resolve_run_profile(profile)
+    print(
+        f"  Run profile: {profile_name} "
+        f"(ctx={profile_settings['context_max_chars']}, "
+        f"extract_tokens={profile_settings['extract_max_tokens']}, "
+        f"write_tokens={profile_settings['write_max_tokens']}, "
+        f"merge_tokens={profile_settings['merge_max_tokens']}, "
+        f"top_k={profile_settings['retrieve_top_k']})",
+        flush=True,
+    )
+
     # 2. Split into chapters and chunk each one
-    print("\n[2/6] Splitting into chapters and chunking...")
+    print("\n[2/6] Splitting into chapters and chunking...", flush=True)
     chapters = split_into_chapters(full_text)
     # Smart chunking auto-selects page/headings/paragraph/size strategy.
     all_chunks = smart_chunk(full_text, pages_per_chunk=2)
-    print(f"  Total chunks: {len(all_chunks)}")
+    print(f"  Total chunks: {len(all_chunks)}", flush=True)
 
     # For flashcards/cheatsheet: compressed summary (first chunk per chapter)
     summary_text = _chapter_summary_text(chapters)
 
     # 3. Build concept index — Pass 1
-    print("\n[3/6] Building concept index (Pass 1)...")
+    print("\n[3/6] Building concept index (Pass 1)...", flush=True)
     concepts, index_text = _build_index(chapters)
-    print(f"  Found {len(concepts)} concepts: {', '.join(concepts)}")
+    print(f"  Found {len(concepts)} concepts: {', '.join(concepts)}", flush=True)
 
     subject = _get_subject(raw_stem, concepts, subject_override, batch_mode)
 
     # Build concept graph for active linking (system decides what should link)
-    print("\n[Pass 1.5] Building concept relationship graph...")
+    print("\n[Pass 1.5] Building concept relationship graph...", flush=True)
     concept_graph = build_concept_graph(concepts, all_chunks)
-    print(f"  Concept relationships mapped")
+    print(f"  Concept relationships mapped", flush=True)
 
     # 4. Generate wiki pages — Pass 2 (incremental: new / merge / skip)
-    print(f"\n[4/6] Processing {len(concepts)} concepts (Pass 2)...")
+    print(f"\n[4/6] Processing {len(concepts)} concepts (Pass 2)...", flush=True)
     vault_state = load_vault_state(output_dir)
     all_vault_pages = _collect_vault_pages(vault_state)
     wiki_pages = {}         # new pages to write
@@ -604,72 +725,146 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
     wiki_prompt_template = load_prompt("wiki")
     merge_prompt_template = load_prompt("merge")
 
-    for i, concept in enumerate(concepts):
-        distilled_facts = _distill_concept_context(all_chunks, concept, concepts, max_chars=4000)
-
+    def _process_single_concept(i: int, concept: str) -> dict:
+        """Run pass-2 processing for one concept in isolation."""
+        distilled_facts = _distill_concept_context(
+            all_chunks,
+            concept,
+            concepts,
+            max_chars=profile_settings["context_max_chars"],
+            retrieve_top_k=profile_settings["retrieve_top_k"],
+            extract_max_tokens=profile_settings["extract_max_tokens"],
+        )
         existing_path = find_existing_page(concept, subject, vault_state)
+        near_dup = None
 
         # Cross-run near-duplicate check — catches spelling variants like
         # "Kasiski Test" matching existing "Kasisky Test"
         if existing_path is None and all_vault_pages:
             near_dup = find_near_duplicate(concept, all_vault_pages)
             if near_dup:
-                # Treat as a merge with the near-duplicate page
                 subject_pages = vault_state["pages"].get(subject, {})
                 if near_dup in subject_pages:
                     existing_path = subject_pages[near_dup]
-                    print(f"  [{i+1}/{len(concepts)}] NEAR-DUP: "
-                          f"{concept} ≈ {near_dup}")
 
         if existing_path is None:
-            # NEW PAGE — generate from scratch
-            print(f"  [{i+1}/{len(concepts)}] NEW: {concept} "
-                  f"({len(distilled_facts):,} chars distilled)...")
             page_prompt = (wiki_prompt_template
                            .replace("{concept}", concept)
                            .replace("{index}", concept_names)
                            .replace("{concept_names}", concept_names)
                            .replace("{facts}", distilled_facts)
                            .replace("{text}", distilled_facts))
-            page_raw = query(page_prompt, task="write", max_tokens=1500)
+            page_raw = query(
+                page_prompt,
+                task="write",
+                max_tokens=profile_settings["write_max_tokens"],
+            )
             filename, page_content = parse_wiki_page(page_raw)
             page_content = fix_wikilinks(page_content, concepts,
                                          vault_pages=all_vault_pages)
-            # Active linking: graph neighbors + concepts found in generated content.
             graph_related = set(concept_graph.get(concept, set()))
             content_related = set(find_related_concepts(page_content, concepts))
             active_related = sorted((graph_related | content_related) - {concept})
             page_content = inject_active_wikilinks(page_content, active_related, concepts)
             page_content = add_frontmatter(filename, page_content, concepts,
                                            subject=subject)
-            wiki_pages[filename] = page_content
+            return {
+                "index": i,
+                "concept": concept,
+                "kind": "new",
+                "near_dup": near_dup,
+                "distilled_len": len(distilled_facts),
+                "filename": filename,
+                "content": page_content,
+            }
 
+        existing_content = Path(existing_path).read_text(encoding="utf-8")
+        merge_prompt = (merge_prompt_template
+                        .replace("{existing_content}", existing_content)
+                        .replace("{concept}", concept)
+                        .replace("{facts}", distilled_facts)
+                        .replace("{new_content}", distilled_facts)
+                        .replace("{source}", subject)
+                        .replace("{concept_names}", concept_names))
+        merge_raw = query(
+            merge_prompt,
+            task="write",
+            max_tokens=profile_settings["merge_max_tokens"],
+        )
+
+        if merge_raw.strip() == "NO_UPDATE":
+            return {
+                "index": i,
+                "concept": concept,
+                "kind": "skip",
+                "near_dup": near_dup,
+                "existing_path": existing_path,
+            }
+
+        merge_raw = fix_wikilinks(merge_raw, concepts,
+                                  vault_pages=all_vault_pages)
+        graph_related = set(concept_graph.get(concept, set()))
+        content_related = set(find_related_concepts(merge_raw, concepts))
+        active_related = sorted((graph_related | content_related) - {concept})
+        merge_raw = inject_active_wikilinks(merge_raw, active_related, concepts)
+        return {
+            "index": i,
+            "concept": concept,
+            "kind": "merge",
+            "near_dup": near_dup,
+            "existing_path": existing_path,
+            "stem": Path(existing_path).stem,
+            "content": merge_raw,
+        }
+
+    concept_workers = _resolve_max_workers(
+        max_workers,
+        default_workers=profile_settings["default_max_workers"],
+    )
+    print(f"  Parallel concept workers: {concept_workers}", flush=True)
+
+    results: list[dict] = []
+    concept_errors: list[tuple[int, str, str]] = []
+    total_concepts = len(concepts)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=concept_workers) as executor:
+        futures = {}
+        for i, concept in enumerate(concepts):
+            print(f"  [{i+1}/{total_concepts}] QUEUED: {concept}", flush=True)
+            future = executor.submit(_process_single_concept, i, concept)
+            futures[future] = (i, concept)
+
+        for future in as_completed(futures):
+            i, concept = futures[future]
+            try:
+                item = future.result()
+                results.append(item)
+                completed += 1
+                kind = item.get("kind", "unknown").upper()
+                near_dup = item.get("near_dup")
+                if near_dup:
+                    print(f"  [{i+1}/{total_concepts}] DONE ({completed}/{total_concepts}) {kind}: {concept} (near-dup: {near_dup})", flush=True)
+                else:
+                    print(f"  [{i+1}/{total_concepts}] DONE ({completed}/{total_concepts}) {kind}: {concept}", flush=True)
+            except Exception as exc:
+                concept_errors.append((i, concept, str(exc)))
+                completed += 1
+                print(f"  [{i+1}/{total_concepts}] FAILED ({completed}/{total_concepts}): {concept}", flush=True)
+
+    # Apply results in original concept order for deterministic output.
+    for item in sorted(results, key=lambda x: x["index"]):
+        kind = item["kind"]
+        if kind == "new":
+            wiki_pages[item["filename"]] = item["content"]
+        elif kind == "merge":
+            merged_pages[item["stem"]] = (item["existing_path"], item["content"])
         else:
-            # EXISTING PAGE — diff-aware merge
-            print(f"  [{i+1}/{len(concepts)}] MERGE: {concept} "
-                  f"(existing: {Path(existing_path).name})...")
-            existing_content = Path(existing_path).read_text(encoding="utf-8")
-            merge_prompt = (merge_prompt_template
-                            .replace("{existing_content}", existing_content)
-                            .replace("{concept}", concept)
-                            .replace("{facts}", distilled_facts)
-                            .replace("{new_content}", distilled_facts)
-                            .replace("{source}", subject)
-                            .replace("{concept_names}", concept_names))
-            merge_raw = query(merge_prompt, task="write", max_tokens=800)
+            skipped.append(item["concept"])
 
-            if merge_raw.strip() == "NO_UPDATE":
-                print(f"    → No new content, skipping")
-                skipped.append(concept)
-            else:
-                merge_raw = fix_wikilinks(merge_raw, concepts,
-                                          vault_pages=all_vault_pages)
-                graph_related = set(concept_graph.get(concept, set()))
-                content_related = set(find_related_concepts(merge_raw, concepts))
-                active_related = sorted((graph_related | content_related) - {concept})
-                merge_raw = inject_active_wikilinks(merge_raw, active_related, concepts)
-                merged_pages[Path(existing_path).stem] = (existing_path, merge_raw)
-                print(f"    → Merged new content")
+    if concept_errors:
+        print(f"  [warn] {len(concept_errors)} concepts failed during parallel processing:", flush=True)
+        for i, concept, err in sorted(concept_errors, key=lambda x: x[0]):
+            print(f"    - [{i+1}/{len(concepts)}] {concept}: {err}", flush=True)
 
     # Write new pages
     if wiki_pages:
@@ -764,6 +959,25 @@ Examples:
             "Defaults to PDF_TO_NOTES_PROVIDER from environment."
         ),
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help=(
+            "Maximum parallel workers for concept pass (Pass 2). "
+            "Defaults to PDF_TO_NOTES_MAX_WORKERS or an auto value."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["speed", "quality", "hybrid"],
+        default=None,
+        help=(
+            "Performance/quality profile. "
+            "Also configurable via PDF_TO_NOTES_PROFILE."
+            "'balanced' is an alias for 'hybrid'."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.subject and len(args.pdfs) > 1:
@@ -786,7 +1000,9 @@ Examples:
         try:
             process_pdf(pdf_path, vault,
                         subject_override=args.subject if len(args.pdfs) == 1 else "",
-                        batch_mode=batch)
+                        batch_mode=batch,
+                        max_workers=args.max_workers,
+                        profile=args.profile)
         except Exception as e:
             print(f"\nERROR processing {pdf_path}: {e}")
             failed.append((pdf_path, str(e)))

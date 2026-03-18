@@ -36,7 +36,7 @@ class OfflineQueryStub:
     def __init__(self, index_outputs):
         self.index_outputs = list(index_outputs)
 
-    def __call__(self, prompt: str, system: str = "", max_tokens: int = 4096, quality: bool = False, task: str = "cheap") -> str:
+    def __call__(self, prompt: str, system: str = "", max_tokens: int = 4096, task: str = "cheap", **kwargs) -> str:
         if prompt.startswith("INDEX_PROMPT"):
             return self.index_outputs.pop(0)
 

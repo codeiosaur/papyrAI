@@ -5,6 +5,19 @@ Scores text chunks by relevance to a concept using keyword matching.
 
 import re
 import math
+import hashlib
+
+
+# Cache for deduplicated chunks to avoid recomputing expensive Jaccard comparisons
+_DEDUP_CACHE: dict[str, list[str]] = {}
+
+
+def _chunks_cache_key(chunks: list[str]) -> str:
+    """Generate a cache key based on chunk hashes."""
+    content_hash = hashlib.md5(
+        "\n".join(chunks[:100]).encode()  # Hash first 100 chunks for speed
+    ).hexdigest()
+    return f"{len(chunks)}_{content_hash}"
 
 
 def _normalize_chunk(text: str) -> str:
@@ -22,7 +35,14 @@ def deduplicate_chunks(
 
     This primarily catches overlap artifacts introduced by chunking,
     where adjacent chunks can share large repeated spans.
+    
+    Uses a cache to avoid recomputing expensive Jaccard comparisons.
     """
+    # Check cache first
+    cache_key = _chunks_cache_key(chunks)
+    if cache_key in _DEDUP_CACHE:
+        return _DEDUP_CACHE[cache_key]
+    
     unique: list[str] = []
     normalized_seen: list[str] = []
 
@@ -58,6 +78,8 @@ def deduplicate_chunks(
             unique.append(chunk)
             normalized_seen.append(norm)
 
+    # Cache the result
+    _DEDUP_CACHE[cache_key] = unique
     return unique
 
 
@@ -210,6 +232,25 @@ def retrieve_ranked_chunks(
     top_k: int = 3,
 ) -> list[str]:
     """Return top-ranked relevant chunks before context-size limiting."""
+    ranked_with_scores = retrieve_ranked_chunks_with_scores(
+        chunks=chunks,
+        concept=concept,
+        related_concepts=related_concepts,
+        top_k=top_k,
+    )
+    return [chunk for chunk, _ in ranked_with_scores]
+
+
+def retrieve_ranked_chunks_with_scores(
+    chunks: list[str],
+    concept: str,
+    related_concepts: list[str] = [],
+    top_k: int = 3,
+) -> list[tuple[str, float]]:
+    """Return top-ranked relevant chunks with their relevance scores.
+    
+    Returns list of (chunk, score) tuples sorted by score descending.
+    """
     if not chunks:
         return []
 
@@ -218,7 +259,7 @@ def retrieve_ranked_chunks(
         return []
 
     if len(deduped_chunks) == 1:
-        return [deduped_chunks[0]]
+        return [(deduped_chunks[0], 1.0)]
 
     related = related_concepts or []
 
@@ -239,9 +280,36 @@ def retrieve_ranked_chunks(
     scored.sort(key=lambda x: x[0], reverse=True)
 
     if scored[0][0] == 0:
-        return [deduped_chunks[0]]
+        return [(deduped_chunks[0], 0.0)]
 
-    return [chunk for _, _, chunk in scored[:top_k]]
+    # Return (chunk, score) tuples
+    return [(chunk, score) for score, _, chunk in scored[:top_k]]
+
+
+def _compute_adaptive_context_size(
+    avg_score: float,
+    base_max_chars: int,
+    min_chars: int = 1500,
+    max_chars: int = 5000,
+) -> int:
+    """
+    Scale context size based on BM25 relevance score.
+    
+    High score (tight signal) → smaller context needed
+    Low score (weak signal) → larger context for quality
+    
+    avg_score: average BM25 relevance score (higher = better match)
+    base_max_chars: default context size from profile
+    """
+    # Normalize score to 0-1 scale (BM25 scores are unbounded, but typically 0-50 for us)
+    normalized = min(avg_score / 20.0, 1.0)  # 0-20 → 0-1
+    
+    # Inverse scaling: high score uses less context
+    # Formula: at 100% relevance (score=1.0), use min_chars (tight)
+    #         at 0% relevance (score=0), use max_chars (loose)
+    context_size = max_chars - (normalized * (max_chars - min_chars))
+    
+    return max(min_chars, min(int(context_size), max_chars))
 
 
 def limit_context(chunks: list[str], max_chars: int = 4000) -> str:

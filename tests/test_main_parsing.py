@@ -61,6 +61,20 @@ def test_parse_index_handles_inline_concepts_without_relationships_section():
     assert concepts == ["RSA", "AES", "One-Time Pad (OTP)"]
 
 
+def test_parse_index_trims_sentence_like_concept_lines():
+    raw = """
+CONCEPTS:
+- RSA depends on difficulties in factoring large composites into their prime factors.
+- Diffie-Hellman Key Exchange is based on modular arithmetic.
+RELATIONSHIPS:
+- RSA -> Diffie-Hellman Key Exchange
+""".strip()
+
+    concepts, _ = main.parse_index(raw)
+
+    assert concepts == ["RSA", "Diffie-Hellman Key Exchange"]
+
+
 def test_parse_wiki_page_uses_filename_header_when_present():
     raw = """FILENAME: RSA (Rivest-Shamir-Adleman)
 ## RSA (Rivest-Shamir-Adleman)

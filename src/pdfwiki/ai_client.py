@@ -8,7 +8,7 @@ Task-based model routing:
 - "write": high-quality wiki pages and merges (env: PDF_TO_NOTES_MODEL_WRITE)
 
 For Anthropic users: set these env vars to override the defaults.
-For Ollama users: all tasks use the same OLLAMA_MODEL.
+For Ollama users: task env vars are supported, with OLLAMA_MODEL as fallback.
 """
 
 import os
@@ -23,15 +23,18 @@ PROVIDER = os.environ.get("PDF_TO_NOTES_PROVIDER", "anthropic").strip().lower()
 
 # Anthropic API key
 CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+CLAUDE_CLIENT = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
 
 # Ollama configuration
 OLLAMA_BASE_URL = os.environ.get("PDF_TO_NOTES_OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.environ.get("PDF_TO_NOTES_OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_CLIENT = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
 
 # Task-based routing: map task names to model selection.
-# For Anthropic, these env vars specify which Claude model to use for each task.
+TASK_NAMES = ("cheap", "extract", "write")
+
+# Anthropic API: these env vars specify which Claude model to use for each task.
 # If not set, sensible defaults are provided.
-# For Ollama, these are ignored and OLLAMA_MODEL is always used.
 TASK_MODELS = {
     "cheap": os.environ.get(
         "PDF_TO_NOTES_MODEL_CHEAP",
@@ -45,6 +48,13 @@ TASK_MODELS = {
         "PDF_TO_NOTES_MODEL_WRITE",
         "claude-sonnet-4-20250514"  # default: high-quality model for wiki pages
     ),
+}
+
+# Ollama task routing (falls back to OLLAMA_MODEL when task-specific vars are absent).
+OLLAMA_TASK_MODELS = {
+    "cheap": os.environ.get("PDF_TO_NOTES_MODEL_CHEAP", OLLAMA_MODEL),
+    "extract": os.environ.get("PDF_TO_NOTES_MODEL_EXTRACT", OLLAMA_MODEL),
+    "write": os.environ.get("PDF_TO_NOTES_MODEL_WRITE", OLLAMA_MODEL),
 }
 
 
@@ -107,18 +117,19 @@ def query(
     - "write": high-quality, detailed responses (wiki pages, merges)
 
     For Anthropic: uses task-based model selection from environment variables.
-    For Ollama: ignores task, always uses OLLAMA_MODEL.
+    For Ollama: uses task-based model selection with OLLAMA_MODEL fallback.
     """
+    if task not in TASK_NAMES:
+        raise ValueError(
+            f"Invalid task: {task}. Expected one of: {list(TASK_NAMES)}"
+        )
+
     if PROVIDER == "anthropic":
-        # Validate task and get the configured model for this task
-        if task not in TASK_MODELS:
-            raise ValueError(
-                f"Invalid task: {task}. Expected one of: {list(TASK_MODELS.keys())}"
-            )
         model = TASK_MODELS[task]
         return _query_anthropic(prompt, system, max_tokens, model)
     if PROVIDER == "ollama":
-        return _query_ollama(prompt, system, max_tokens)
+        model = OLLAMA_TASK_MODELS.get(task) or OLLAMA_MODEL
+        return _query_ollama(prompt, system, max_tokens, model)
 
     raise ValueError(
         f"Unsupported PDF_TO_NOTES_PROVIDER: {PROVIDER}. "
@@ -133,8 +144,6 @@ def _query_anthropic(prompt: str, system: str, max_tokens: int, model: str) -> s
             "Add it to your .env file: ANTHROPIC_API_KEY=sk-ant-..."
         )
 
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-
     kwargs = {
         "model": model,
         "max_tokens": max_tokens,
@@ -143,20 +152,18 @@ def _query_anthropic(prompt: str, system: str, max_tokens: int, model: str) -> s
     if system:
         kwargs["system"] = system
 
-    response = client.messages.create(**kwargs)
+    response = CLAUDE_CLIENT.messages.create(**kwargs)
     return response.content[0].text.strip()
 
 
-def _query_ollama(prompt: str, system: str, max_tokens: int) -> str:
-    client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
-
+def _query_ollama(prompt: str, system: str, max_tokens: int, model: str) -> str:
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    response = client.chat.completions.create(
-        model=OLLAMA_MODEL,
+    response = OLLAMA_CLIENT.chat.completions.create(
+        model=model,
         messages=messages,
         max_tokens=max_tokens,
     )

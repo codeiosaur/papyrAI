@@ -8,7 +8,7 @@ import pdfwiki.main as main
 def test_run_cli_processes_each_pdf_in_multi_mode(monkeypatch, tmp_path):
     calls = []
 
-    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False):
+    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False, max_workers=None, profile=None):
         calls.append((pdf_path, output_dir, subject_override, batch_mode))
 
     monkeypatch.setattr(main, "process_pdf", fake_process_pdf)
@@ -30,7 +30,7 @@ def test_run_cli_processes_each_pdf_in_multi_mode(monkeypatch, tmp_path):
 def test_run_cli_single_pdf_respects_subject_override(monkeypatch, tmp_path):
     calls = []
 
-    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False):
+    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False, max_workers=None, profile=None):
         calls.append((pdf_path, output_dir, subject_override, batch_mode))
 
     monkeypatch.setattr(main, "process_pdf", fake_process_pdf)
@@ -59,3 +59,23 @@ def test_run_cli_rejects_subject_with_multiple_pdfs(tmp_path):
             "--subject",
             "Cryptography",
         ])
+
+
+def test_run_cli_passes_profile_to_process_pdf(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False, max_workers=None, profile=None):
+        seen["profile"] = profile
+
+    monkeypatch.setattr(main, "process_pdf", fake_process_pdf)
+
+    code = main.run_cli([
+        "lecture.pdf",
+        "--vault",
+        str(tmp_path),
+        "--profile",
+        "speed",
+    ])
+
+    assert code == 0
+    assert seen["profile"] == "speed"
