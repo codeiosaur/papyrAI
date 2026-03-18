@@ -1,11 +1,14 @@
 """
 AI client module.
-Toggle between Ollama (local/free) and Claude API (cloud/paid) by changing PROVIDER below.
+Toggle between Ollama (local/free) and Claude API (cloud/paid) by environment variables.
 
-Model routing:
-- CLAUDE_FAST_MODEL: used for index, flashcards, cheatsheet (Haiku — cheap)
-- CLAUDE_QUALITY_MODEL: used for wiki page generation (Sonnet — best output)
-- Ollama always uses OLLAMA_MODEL regardless of task
+Task-based model routing:
+- "cheap": general use — index, flashcards, cheatsheet (env: PDF_TO_NOTES_MODEL_CHEAP)
+- "extract": fact extraction (env: PDF_TO_NOTES_MODEL_EXTRACT)
+- "write": high-quality wiki pages and merges (env: PDF_TO_NOTES_MODEL_WRITE)
+
+For Anthropic users: set these env vars to override the defaults.
+For Ollama users: all tasks use the same OLLAMA_MODEL.
 """
 
 import os
@@ -18,20 +21,31 @@ load_dotenv()
 # --- CONFIG ---
 PROVIDER = os.environ.get("PDF_TO_NOTES_PROVIDER", "anthropic").strip().lower()
 
-# Claude models — swap either string to change quality/cost tradeoff
-CLAUDE_QUALITY_MODEL = os.environ.get(
-    "PDF_TO_NOTES_CLAUDE_QUALITY_MODEL",
-    "claude-sonnet-4-20250514",
-)  # wiki pages — Sonnet 4 (cheaper than 4.6, still high quality)
-CLAUDE_FAST_MODEL = os.environ.get(
-    "PDF_TO_NOTES_CLAUDE_FAST_MODEL",
-    "claude-haiku-4-5-20251001",
-)  # index, flashcards, cheatsheet
+# Anthropic API key
+CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
+# Ollama configuration
 OLLAMA_BASE_URL = os.environ.get("PDF_TO_NOTES_OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.environ.get("PDF_TO_NOTES_OLLAMA_MODEL", "llama3.1:8b")
 
-CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+# Task-based routing: map task names to model selection.
+# For Anthropic, these env vars specify which Claude model to use for each task.
+# If not set, sensible defaults are provided.
+# For Ollama, these are ignored and OLLAMA_MODEL is always used.
+TASK_MODELS = {
+    "cheap": os.environ.get(
+        "PDF_TO_NOTES_MODEL_CHEAP",
+        "claude-haiku-4-5-20251001"  # default: fast, low-cost model
+    ),
+    "extract": os.environ.get(
+        "PDF_TO_NOTES_MODEL_EXTRACT",
+        "claude-haiku-4-5-20251001"  # default: fast model for structured extraction
+    ),
+    "write": os.environ.get(
+        "PDF_TO_NOTES_MODEL_WRITE",
+        "claude-sonnet-4-20250514"  # default: high-quality model for wiki pages
+    ),
+}
 
 
 def set_provider(provider: str) -> None:
@@ -53,7 +67,7 @@ def get_provider() -> str:
 def extract_facts(concept: str, context: str, max_tokens: int = 400) -> str:
     """
     Extract structured factual statements about a concept.
-    Uses a cheaper model if configured.
+    Uses the task="extract" model selection (Haiku or Ollama by default).
     """
 
     prompt = f"""
@@ -74,7 +88,7 @@ def extract_facts(concept: str, context: str, max_tokens: int = 400) -> str:
         prompt=prompt,
         system="You extract factual knowledge for study notes.",
         max_tokens=max_tokens,
-        quality=False
+        task="extract"
     )
 
 
@@ -82,17 +96,26 @@ def query(
     prompt: str,
     system: str = "",
     max_tokens: int = 4096,
-    quality: bool = False   # True = Sonnet, False = Haiku (Antrhopic only; Ollama ignores this flag)
+    task: str = "cheap"
 ) -> str:
     """
     Send a prompt to the AI and return the response text.
 
-    When using Anthropic API:
-    quality=True  → use CLAUDE_QUALITY_MODEL (Sonnet) — for wiki pages
-    quality=False → use CLAUDE_FAST_MODEL (Haiku)    — for everything else
+    Tasks:
+    - "cheap": general use, cost-optimized (default)
+    - "extract": structured fact extraction
+    - "write": high-quality, detailed responses (wiki pages, merges)
+
+    For Anthropic: uses task-based model selection from environment variables.
+    For Ollama: ignores task, always uses OLLAMA_MODEL.
     """
     if PROVIDER == "anthropic":
-        model = CLAUDE_QUALITY_MODEL if quality else CLAUDE_FAST_MODEL
+        # Validate task and get the configured model for this task
+        if task not in TASK_MODELS:
+            raise ValueError(
+                f"Invalid task: {task}. Expected one of: {list(TASK_MODELS.keys())}"
+            )
+        model = TASK_MODELS[task]
         return _query_anthropic(prompt, system, max_tokens, model)
     if PROVIDER == "ollama":
         return _query_ollama(prompt, system, max_tokens)

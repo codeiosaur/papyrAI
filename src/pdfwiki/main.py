@@ -484,7 +484,7 @@ def detect_subject(raw_stem: str, concepts: list[str] | None = None,
             f"2-4 words maximum. Examples: \"Cryptography\", \"Operating Systems\", "
             f"\"Network Security\", \"Linear Algebra\""
         )
-        inferred = query(prompt, max_tokens=20).strip().strip('"\'\n')
+        inferred = query(prompt, task="cheap", max_tokens=20).strip().strip('"\'\\n')
         if inferred and len(inferred.split()) <= 5 and '.' not in inferred:
             print(f"  Subject inferred from content: \"{inferred}\"")
             return inferred
@@ -514,7 +514,7 @@ def _build_index(chapters: list[dict]) -> tuple[list[str], str]:
     """Run pass-1 indexing and return parsed concepts and raw index text."""
     index_text_input = "\n\n---\n\n".join(ch["content"] for ch in chapters)
     index_prompt = load_prompt("index").replace("{text}", index_text_input)
-    index_raw = query(index_prompt, max_tokens=4000)
+    index_raw = query(index_prompt, task="cheap", max_tokens=4000)
     concepts, index_text = parse_index(index_raw)
     if not concepts:
         raise ValueError(
@@ -632,7 +632,7 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
                            .replace("{concept_names}", concept_names)
                            .replace("{facts}", distilled_facts)
                            .replace("{text}", distilled_facts))
-            page_raw = query(page_prompt, quality=True, max_tokens=1500)
+            page_raw = query(page_prompt, task="write", max_tokens=1500)
             filename, page_content = parse_wiki_page(page_raw)
             page_content = fix_wikilinks(page_content, concepts,
                                          vault_pages=all_vault_pages)
@@ -657,7 +657,7 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
                             .replace("{new_content}", distilled_facts)
                             .replace("{source}", subject)
                             .replace("{concept_names}", concept_names))
-            merge_raw = query(merge_prompt, quality=True, max_tokens=800)
+            merge_raw = query(merge_prompt, task="write", max_tokens=800)
 
             if merge_raw.strip() == "NO_UPDATE":
                 print(f"    → No new content, skipping")
@@ -704,7 +704,7 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
                       .replace("{concept_list}", concept_list)
                       .replace("{relationships}", relationships[:2000]))
 
-        moc_raw = query(moc_prompt, quality=False, max_tokens=2000)  # Haiku
+        moc_raw = query(moc_prompt, task="cheap", max_tokens=2000)
         _, moc_content = parse_wiki_page(moc_raw)
         moc_content = add_frontmatter(subject, moc_content, all_concepts_for_moc,
                                       subject=subject,
@@ -719,10 +719,10 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
 
     # 6. Flashcards + cheatsheet on summary text
     print("\n[6/6] Generating flashcards and cheat sheet...")
-    cards_raw = query(load_prompt("flashcards").replace("{text}", summary_text))  # Haiku
+    cards_raw = query(load_prompt("flashcards").replace("{text}", summary_text), task="cheap")
     write_flashcards(output_dir, subject, cards_raw)
 
-    sheet_raw = query(load_prompt("cheatsheet").replace("{text}", summary_text))  # Haiku
+    sheet_raw = query(load_prompt("cheatsheet").replace("{text}", summary_text), task="cheap")
     write_cheatsheet(output_dir, subject, sheet_raw)
 
     print(f"\nDone! Output written to: {output_dir}/")
