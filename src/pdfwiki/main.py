@@ -25,7 +25,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(src_root))
 
 from pdfwiki.extractor import extract_text, split_into_chapters, chunk_text, chunk_by_page
-from pdfwiki.retriever import retrieve_chunks, retrieve_ranked_chunks, limit_context
+from pdfwiki.retriever import retrieve_chunks, retrieve_ranked_chunks, limit_context, find_related_concepts, build_concept_graph
 from pdfwiki.ai_client import query, extract_facts, set_provider, get_provider
 from pdfwiki.writer import write_wiki, write_flashcards, write_cheatsheet
 from pdfwiki.vault import load_vault_state, find_existing_page
@@ -354,6 +354,50 @@ def add_frontmatter(filename: str, content: str, concepts: list[str],
     return "\n".join(lines) + "\n" + content
 
 
+def inject_active_wikilinks(content: str, related_concepts: list[str],
+                           all_concepts: list[str]) -> str:
+    """
+    Inject wikilinks to related concepts that appear in the content.
+    This enables the "system actively decides what should be linked" behavior.
+    
+    Only links concepts that:
+    - Appear as whole words or phrases in the content
+    - Are not already wikilinked
+    - Are in the all_concepts list (to avoid linking outside the knowledge base)
+    
+    Args:
+        content: Wiki page content to augment with links
+        related_concepts: Concepts that should be linked (from concept graph)
+        all_concepts: All known concepts (validates link targets)
+    """
+    linked_content = content
+    concept_set = set(all_concepts)
+    
+    for related in related_concepts:
+        if related not in concept_set:
+            continue
+        
+        # Skip if already wikilinked
+        if f'[[{related}]]' in linked_content:
+            continue
+        
+        # Build pattern: match concept as whole words/phrases
+        escaped = re.escape(related)
+        # Match with word boundaries (handles punctuation around the concept)
+        pattern = rf'\b{escaped}\b'
+        
+        # Replace first occurrence only (conservative: avoid over-linking)
+        linked_content = re.sub(
+            pattern,
+            f'[[{related}]]',
+            linked_content,
+            count=1,
+            flags=re.IGNORECASE
+        )
+    
+    return linked_content
+
+
 # --- Subject detection ---
 
 # Filenames that tell us nothing about the subject
@@ -525,7 +569,7 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
 
     # 1. Extract text
     print("\n[1/6] Extracting text from PDF...")
-    full_text = extract_text(pdf_path)
+    full_text = extract_text(pdf_path, use_markdown=True)
 
     # 2. Split into chapters and chunk each one
     print("\n[2/6] Splitting into chapters and chunking...")
@@ -544,6 +588,11 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
     print(f"  Found {len(concepts)} concepts: {', '.join(concepts)}")
 
     subject = _get_subject(raw_stem, concepts, subject_override, batch_mode)
+
+    # Build concept graph for active linking (system decides what should link)
+    print("\n[Pass 1.5] Building concept relationship graph...")
+    concept_graph = build_concept_graph(concepts, all_chunks)
+    print(f"  Concept relationships mapped")
 
     # 4. Generate wiki pages — Pass 2 (incremental: new / merge / skip)
     print(f"\n[4/6] Processing {len(concepts)} concepts (Pass 2)...")
@@ -587,6 +636,11 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
             filename, page_content = parse_wiki_page(page_raw)
             page_content = fix_wikilinks(page_content, concepts,
                                          vault_pages=all_vault_pages)
+            # Active linking: graph neighbors + concepts found in generated content.
+            graph_related = set(concept_graph.get(concept, set()))
+            content_related = set(find_related_concepts(page_content, concepts))
+            active_related = sorted((graph_related | content_related) - {concept})
+            page_content = inject_active_wikilinks(page_content, active_related, concepts)
             page_content = add_frontmatter(filename, page_content, concepts,
                                            subject=subject)
             wiki_pages[filename] = page_content
@@ -611,6 +665,10 @@ def process_pdf(pdf_path: str, output_dir: str, subject_override: str = "", batc
             else:
                 merge_raw = fix_wikilinks(merge_raw, concepts,
                                           vault_pages=all_vault_pages)
+                graph_related = set(concept_graph.get(concept, set()))
+                content_related = set(find_related_concepts(merge_raw, concepts))
+                active_related = sorted((graph_related | content_related) - {concept})
+                merge_raw = inject_active_wikilinks(merge_raw, active_related, concepts)
                 merged_pages[Path(existing_path).stem] = (existing_path, merge_raw)
                 print(f"    → Merged new content")
 

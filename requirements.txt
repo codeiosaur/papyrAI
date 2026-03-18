@@ -4,3 +4,4 @@ anthropic>=0.20.0
 python-dotenv>=1.0.0
 pytest>=8.0.0
 pre-commit>=3.7.0
+markitdown[office]>=0.1.0

@@ -4,17 +4,81 @@ Format-agnostic: works on slide decks, textbooks, papers, and notes.
 """
 
 import re
+import importlib
 import pdfplumber
 from pathlib import Path
 
 
+# --- Text conversion to Markdown ---
+
+def extract_text_with_markitdown(file_path: str) -> str:
+    """
+    Extract text from any file format (PDF, PPTX, DOCX, etc.) using markitdown.
+    Falls back to pdfplumber for PDFs if markitdown is unavailable.
+    Returns markdown-formatted text with page separators.
+    
+    Requires: pip install markitdown[office] (for Office formats)
+              or pip install markitdown[pdf] (for enhanced PDF support)
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    
+    try:
+        markitdown_mod = importlib.import_module("markitdown")
+        MarkItDown = getattr(markitdown_mod, "MarkItDown")
+    except Exception:
+        print(f"  [warn] markitdown not installed, falling back to pdfplumber for {path.suffix} files")
+        if path.suffix.lower() == '.pdf':
+            return extract_text(file_path, use_markdown=False)
+        raise ImportError(
+            "markitdown required for non-PDF formats. "
+            "Install with: pip install 'markitdown[office]'"
+        )
+    
+    mmd = MarkItDown()
+    
+    try:
+        # Extract markdown directly from the file
+        result = mmd.convert(file_path)
+        markdown_text = result.text_content
+        
+        # If no markdown content extracted, fall back to plain extract_text for PDFs
+        if not markdown_text.strip() and path.suffix.lower() == '.pdf':
+            return extract_text(file_path, use_markdown=False)
+        
+        # Estimate page count from content size and line count for page markers
+        lines = markdown_text.splitlines()
+        # Rough estimate: ~50 lines per page in markdown format
+        estimated_pages = max(1, len(lines) // 50)
+        
+        print(f"  Extracted {estimated_pages} estimated pages, {len(markdown_text):,} characters (markdown)")
+        return markdown_text
+        
+    except Exception as e:
+        print(f"  [warn] markitdown extraction failed: {e}")
+        if path.suffix.lower() == '.pdf':
+            print(f"  Falling back to pdfplumber for {file_path}")
+            return extract_text(file_path, use_markdown=False)
+        raise
+
+
 # --- Text extraction ---
 
-def extract_text(pdf_path: str) -> str:
+def extract_text(pdf_path: str, use_markdown: bool = False) -> str:
     """
     Extract all text from a PDF file.
+    
+    Args:
+        pdf_path: Path to PDF file
+        use_markdown: If True, use markitdown for extraction (with markdown formatting).
+                      If False, use pdfplumber (plain text, faster).
+    
     Returns a single string with page separators.
     """
+    if use_markdown:
+        return extract_text_with_markitdown(pdf_path)
+    
     path = Path(pdf_path)
     if not path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")

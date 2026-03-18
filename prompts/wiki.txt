@@ -26,6 +26,11 @@ Rules:
 - End with a ### Related section listing wikilinks with a one-line note on WHY each is related
 - Output ONLY the wiki page. No preamble, no explanation.
 
+LINKING RULES:
+- Prefer linking to concepts in RELATED CONCEPTS
+- When mentioning a concept, use [[exact name]]
+- Do not invent links not in the list
+
 OBSIDIAN FORMATTING — use these where genuinely useful, not on every page:
 
 Callout boxes:

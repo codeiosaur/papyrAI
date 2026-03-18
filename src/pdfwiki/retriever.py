@@ -270,3 +270,26 @@ def limit_context(chunks: list[str], max_chars: int = 4000) -> str:
         total_chars += required
 
     return separator.join(selected)
+
+def find_related_concepts(text: str, concept_names: list[str]) -> list[str]:
+    found = set()
+    text_lower = text.lower()
+
+    for concept in concept_names:
+        if concept.lower() in text_lower:
+            found.add(concept)
+
+    return list(found)
+
+def build_concept_graph(concepts: list[str], chunks: list[str]) -> dict:
+    graph = {c: set() for c in concepts}
+
+    for chunk in chunks:
+        present = [c for c in concepts if c.lower() in chunk.lower()]
+
+        for c1 in present:
+            for c2 in present:
+                if c1 != c2:
+                    graph[c1].add(c2)
+
+    return graph
