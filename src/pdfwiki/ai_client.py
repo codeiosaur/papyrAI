@@ -78,25 +78,35 @@ def extract_facts(concept: str, context: str, max_tokens: int = 400) -> str:
     """
     Extract structured factual statements about a concept.
     Uses the task="extract" model selection (Haiku or Ollama by default).
+    
+    Returns bullet-pointed facts, each a single atomic idea.
+    Prioritizes precision and sourced information.
     """
 
     prompt = f"""
-    Extract clear, factual statements about "{concept}" from the text below.
-    
-    Rules:
-    - Use bullet points
-    - Be concise and precise
-    - No explanations, no fluff
-    - Avoid repetition
-    - Prefer atomic facts (one idea per bullet)
-    
-    TEXT:
-    {context}
-    """
+Extract the most important facts about "{concept}" from the source material.
+Prioritize facts that would appear in a wiki page or study guide.
+
+OUTPUT FORMAT:
+Use bullet points. Each bullet = one atomic fact.
+- Fact statement here
+- Another fact here
+- etc.
+
+RULES (CRITICAL):
+1. Extract ONLY facts explicitly stated in the source
+2. Avoid speculation, inference, or background knowledge
+3. Each fact must stand alone (atomic)
+4. Omit definitions of obviously known terms (e.g., don't define "number")
+5. Omit repetition — state each fact once
+6. Max {max_tokens} tokens total
+
+SOURCE TEXT:
+{context}"""
 
     return query(
         prompt=prompt,
-        system="You extract factual knowledge for study notes.",
+        system="You are a knowledge extraction assistant for academic study wikis. Extract facts with precision. Omit speculation.",
         max_tokens=max_tokens,
         task="extract"
     )

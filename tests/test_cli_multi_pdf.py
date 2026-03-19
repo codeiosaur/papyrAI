@@ -8,8 +8,9 @@ import pdfwiki.main as main
 def test_run_cli_processes_each_pdf_in_multi_mode(monkeypatch, tmp_path):
     calls = []
 
-    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False, max_workers=None, profile=None):
+    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False, max_workers=None, profile=None, existing_concepts=None):
         calls.append((pdf_path, output_dir, subject_override, batch_mode))
+        return []
 
     monkeypatch.setattr(main, "process_pdf", fake_process_pdf)
 
@@ -30,8 +31,9 @@ def test_run_cli_processes_each_pdf_in_multi_mode(monkeypatch, tmp_path):
 def test_run_cli_single_pdf_respects_subject_override(monkeypatch, tmp_path):
     calls = []
 
-    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False, max_workers=None, profile=None):
+    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False, max_workers=None, profile=None, existing_concepts=None):
         calls.append((pdf_path, output_dir, subject_override, batch_mode))
+        return []
 
     monkeypatch.setattr(main, "process_pdf", fake_process_pdf)
 
@@ -64,8 +66,9 @@ def test_run_cli_rejects_subject_with_multiple_pdfs(tmp_path):
 def test_run_cli_passes_profile_to_process_pdf(monkeypatch, tmp_path):
     seen = {}
 
-    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False, max_workers=None, profile=None):
+    def fake_process_pdf(pdf_path, output_dir, subject_override="", batch_mode=False, max_workers=None, profile=None, existing_concepts=None):
         seen["profile"] = profile
+        return []
 
     monkeypatch.setattr(main, "process_pdf", fake_process_pdf)
 

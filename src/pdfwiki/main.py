@@ -84,31 +84,33 @@ RUN_PROFILE_ALIASES = {
 }
 
 RUN_PROFILE_SETTINGS: dict[str, dict[str, int]] = {
-    # Fastest local iteration for most machines.
+    # Fastest local iteration for M3/Llama 3.1 8B.
+    # Optimized for speed without sacrificing quality too much.
     "speed": {
-        "context_max_chars": 2200,
-        "extract_max_tokens": 280,
-        "write_max_tokens": 1000,
-        "merge_max_tokens": 650,
-        "retrieve_top_k": 2,
+        "context_max_chars": 2800,  # Increased: Llama 3.1 handles longer context better
+        "extract_max_tokens": 350,   # Increased: allows richer fact extraction
+        "write_max_tokens": 1100,
+        "merge_max_tokens": 700,
+        "retrieve_top_k": 3,          # Increased: better fact coverage with multiple sources
         "default_max_workers": 4,
     },
-    # Default tradeoff profile.
+    # Balanced tradeoff: quality + reasonable speed (recommended).
     "hybrid": {
-        "context_max_chars": 3000,
-        "extract_max_tokens": 360,
-        "write_max_tokens": 1000,
-        "merge_max_tokens": 700,
-        "retrieve_top_k": 2,
+        "context_max_chars": 3500,   # Increased: more context for nuanced facts
+        "extract_max_tokens": 420,   # Increased: structured fact extraction
+        "write_max_tokens": 1100,
+        "merge_max_tokens": 750,
+        "retrieve_top_k": 3,          # Increased: handles multi-source merges better
         "default_max_workers": 3,
     },
-    # Highest quality, slower throughput.
+    # Highest quality output, slower throughput.
+    # For offline/non-time-sensitive processing.
     "quality": {
-        "context_max_chars": 4800,
-        "extract_max_tokens": 550,
+        "context_max_chars": 5000,   # Increased: maximal context for complex concepts
+        "extract_max_tokens": 600,   # Increased: detailed structured facts
         "write_max_tokens": 1400,
-        "merge_max_tokens": 900,
-        "retrieve_top_k": 3,
+        "merge_max_tokens": 950,
+        "retrieve_top_k": 4,          # Increased: comprehensive multi-source integration
         "default_max_workers": 2,
     },
 }
@@ -161,8 +163,11 @@ def find_near_duplicate(concept: str, vault_pages: list[str], cutoff: float = 0.
     return cq_find_near_duplicate(concept, vault_pages, cutoff=cutoff)
 
 
-def _dedupe_concepts_for_run(concepts: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
-    return cq_dedupe_concepts_for_run(concepts)
+def _dedupe_concepts_for_run(
+    concepts: list[str],
+    existing_concepts: list[str] | None = None,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    return cq_dedupe_concepts_for_run(concepts, existing_concepts)
 
 
 def _build_index(chapters: list[dict]) -> tuple[list[str], str]:
@@ -316,7 +321,8 @@ def process_pdf(
     batch_mode: bool = False,
     max_workers: int | None = None,
     profile: str | None = None,
-):
+    existing_concepts: list[str] | None = None,
+) -> list[str]:
     """Run the full PDF-to-vault pipeline for one PDF.
 
     High-level stages:
@@ -326,11 +332,18 @@ def process_pdf(
     4) MOC refresh (only when new pages are created)
     5) flashcards and cheatsheet generation
 
+    Args:
+        existing_concepts: Concepts extracted from prior PDFs (for batch deduplication)
+    
+    Returns:
+        List of all concepts processed (for passing to next PDF in batch)
+
     Determinism and safety notes:
     - per-concept work runs in parallel but results are applied in original
       concept order to keep output stable across runs.
     - each concept is isolated; failures are recorded and do not stop others.
     - unchanged existing pages are skipped via source-context hash.
+    - cross-PDF deduplication prevents re-processing identical concepts.
     """
     raw_stem = Path(pdf_path).stem
     print(f"\n{'='*50}", flush=True)
@@ -370,6 +383,7 @@ def process_pdf(
         build_index=_build_index,
         filter_concepts_with_evidence=_filter_concepts_with_evidence,
         dedupe_concepts_for_run=_dedupe_concepts_for_run,
+        existing_concepts=existing_concepts,
     )
     concepts = index_result.concepts
     index_text = index_result.index_text
@@ -499,6 +513,10 @@ def process_pdf(
 
     print(f"\nDone! Output written to: {output_dir}/")
     print(f"Wiki pages: {len(wiki_pages)}")
+    
+    # Return master concept list for next PDF in batch
+    master_concepts = (existing_concepts or []) + concepts
+    return master_concepts
 
 
 def run_cli(argv: list[str] | None = None) -> int:
@@ -579,14 +597,19 @@ Examples:
 
     batch = args.batch or len(args.pdfs) > 1
     failed = []
+    master_concepts: list[str] | None = None
 
     for pdf_path in args.pdfs:
         try:
-            process_pdf(pdf_path, vault,
-                        subject_override=args.subject if len(args.pdfs) == 1 else "",
-                        batch_mode=batch,
-                        max_workers=args.max_workers,
-                        profile=args.profile)
+            master_concepts = process_pdf(
+                pdf_path,
+                vault,
+                subject_override=args.subject if len(args.pdfs) == 1 else "",
+                batch_mode=batch,
+                max_workers=args.max_workers,
+                profile=args.profile,
+                existing_concepts=master_concepts if batch else None,
+            )
         except Exception as e:
             print(f"\nERROR processing {pdf_path}: {e}")
             failed.append((pdf_path, str(e)))
@@ -600,6 +623,8 @@ Examples:
     elif len(args.pdfs) > 1:
         print(f"\n{'='*50}")
         print(f"All {len(args.pdfs)} PDFs processed successfully.")
+        if master_concepts:
+            print(f"Total unique concepts across batch: {len(master_concepts)}")
 
     return 0
 

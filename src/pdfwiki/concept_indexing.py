@@ -27,16 +27,20 @@ def run_concept_indexing(
     all_chunks: list[str],
     build_index: Callable[[list[dict]], tuple[list[str], str]],
     filter_concepts_with_evidence: Callable[[list[str], list[str]], tuple[list[str], list[str]]],
-    dedupe_concepts_for_run: Callable[[list[str]], tuple[list[str], list[tuple[str, str]]]],
+    dedupe_concepts_for_run: Callable[[list[str], list[str] | None], tuple[list[str], list[tuple[str, str]]]],
+    existing_concepts: list[str] | None = None,
 ) -> ConceptIndexResult:
     """Run pass-1 concept indexing and quality gating.
 
     The caller supplies concrete adapters so this service remains framework-agnostic
     and easy to test in isolation.
+    
+    Args:
+        existing_concepts: Concepts from prior PDFs in batch (for cross-PDF dedup)
     """
     concepts, index_text = build_index(chapters)
     concepts, dropped_concepts = filter_concepts_with_evidence(concepts, all_chunks)
-    concepts, deduped_pairs = dedupe_concepts_for_run(concepts)
+    concepts, deduped_pairs = dedupe_concepts_for_run(concepts, existing_concepts)
 
     return ConceptIndexResult(
         concepts=concepts,

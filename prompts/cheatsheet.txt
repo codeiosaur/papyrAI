@@ -1,14 +1,21 @@
 You are a study assistant creating a concise cheat sheet from course material.
 
-Given the following course content, create a dense, exam-ready cheat sheet.
+Create a dense, exam-ready reference sheet from the material below.
 
-Rules:
-- Output ONLY the cheat sheet content. No preamble, no explanation.
-- Use markdown formatting: headers, tables, bullet points, code blocks where relevant
-- Organize by topic with ## headers
-- Prioritize: definitions, formulas, processes, comparisons, edge cases
-- Be maximally dense — this is a reference document, not an explanation
-- Aim for something that fits 1-2 printed pages
+RULES:
+- Output ONLY the cheat sheet. No preamble, no explanation.
+- Use markdown: ## headers, tables, bullet points, code blocks
+- Organize by topic
+- Prioritize: definitions, formulas, processes, comparisons, gotchas
+- Be maximally dense — this is a reference, not a tutorial
+- Target: 1-2 printable pages
 
-COURSE CONTENT:
+CONTENT STRUCTURE:
+- Key definitions and terminology first
+- Formulas and technical specifications
+- Processes and algorithm steps (use tables or numbered lists)
+- Common comparisons and trade-offs
+- Important edge cases and gotchas
+
+COURSE MATERIAL:
 {text}

@@ -6,20 +6,29 @@ EXISTING PAGE:
 NEW SOURCE MATERIAL about "{concept}":
 {new_content}
 
+VALID WIKILINKS:
+{concept_names}
+
 ---
 
-Your job is to update the existing page by adding only what is genuinely new.
+Your job is to merge new information into the existing page, preserving structure and style.
 
-Rules:
-- Read the existing page carefully
-- Identify information in the new source that is NOT already covered
-- If the new source adds nothing new, output exactly: NO_UPDATE
-- If there is new content, append it as one or more new sections at the end
-  (before the ### Related section, which should remain last)
-- New sections should use ### headings
-- Label each new section to indicate it came from a different source:
-  ### [Topic] (from {source})
-- Use [[wikilinks]] for any concepts that appear in this list:
-{concept_names}
-- Do NOT rewrite or reformat the existing content
-- Output ONLY the complete updated page (or NO_UPDATE). No preamble.
+CRITICAL RULES:
+1. Read the existing page completely first
+2. Compare new content against existing sections
+3. If NO new information is found, output EXACTLY: NO_UPDATE
+4. If new content exists, preserve the existing page structure
+
+ADDING NEW CONTENT:
+- Append new sections BEFORE the ### Related section (which stays last)
+- Use ### headings for new sections
+- Label new sections: ### [Topic] (from {source})
+- Use [[wikilinks]] only for concepts in {concept_names}
+- DO NOT reformat or rewrite existing content
+- Maintain consistent style with the existing page
+
+OBSIDIAN FORMATTING:
+- Follow the style of existing callouts and formatting
+- Add new callouts only if they enhance clarity
+
+OUTPUT: complete updated page OR NO_UPDATE (nothing else)

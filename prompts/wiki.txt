@@ -13,19 +13,29 @@ FACTS:
 VALID WIKILINK NAMES (copy these exactly, character-for-character):
 {concept_names}
 
-Write a focused, well-structured wiki page for "{concept}" using the facts above. Aim to be thorough but concise. Cover the concept completely without padding.
+Write a focused, well-structured wiki page for "{concept}" using the facts above. Aim to be thorough but concise.
 
-Rules:
-- Use ONLY the facts provided
-- Do not invent new information
-- Start with: FILENAME: {concept}
-- Use ## for the page title, ### for sections
-- Open with a 2-3 sentence lead paragraph summarizing the concept
-- Use [[Page Name]] wikilinks whenever you reference a concept from the index
-- CRITICAL: wikilink names must match the index EXACTLY as written — copy character-for-character
-- For brute-force resistance language, prefer "key space size" over ambiguous phrasing like "small encryption keys"
-- End with a ### Related section listing wikilinks with a one-line note on WHY each is related
-- Output ONLY the wiki page. No preamble, no explanation.
+CRITICAL RULES:
+1. Start ONLY with FILENAME: {concept} (no other preamble)
+2. Use ONLY facts provided — never invent information
+3. Structure: Lead paragraph → Subsections → Related section
+4. Wikilink names must match the index EXACTLY (copy character-for-character)
+5. Link actively: whenever you mention a concept from the index, immediately use [[ExactName]]
+6. No orphaned concepts: every concept mentioned must be from {concept_names}
+
+CONTENT GUIDELINES:
+- Lead paragraph (2-3 sentences): summarize the core definition and why it matters
+- Main content: use ### subsections (limit: 4-6 sections max)
+- For technical details: prefer precise language over metaphors
+- Example: use "key space size" not "small encryption keys"; "N=p*q" not "large numbers"
+
+RELATED SECTION:
+- Use ### Related
+- List only relevant concepts from {concept_names}
+- Format: [[Concept]]: one-line reason it's connected
+- Example: [[AES]]: the primary modern block cipher standard
+
+OUTPUT: wiki page only (no preamble, no explanation)
 
 LINKING RULES:
 - Prefer linking to concepts in RELATED CONCEPTS
@@ -39,7 +49,7 @@ Callout boxes:
 > Use for the single most important definition on the page
 
 > [!example] Worked Example
-> Use when a concrete example significantly aids understanding (calculations, protocol steps)
+> Use when a concrete example significantly aids understanding (calculations, protocol steps), or for critical worked examples
 
 > [!warning] Security Caveat
 > Use for known vulnerabilities, deprecated algorithms, or critical limitations

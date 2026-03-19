@@ -199,16 +199,32 @@ def filter_concepts_with_evidence(concepts: list[str], chunks: list[str]) -> tup
     return kept, dropped
 
 
-def dedupe_concepts_for_run(concepts: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
-    """Dedupe near-identical concept names within the same run."""
-    kept: list[str] = []
+def dedupe_concepts_for_run(
+    concepts: list[str],
+    existing_concepts: list[str] | None = None,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """
+    Dedupe near-identical concept names within the same run and against existing concepts.
+    
+    Args:
+        concepts: Concepts extracted from current PDF
+        existing_concepts: Concepts from previous PDFs in batch (optional)
+    
+    Returns:
+        (deduplicated_concepts, dropped_pairs)
+    """
+    # Start with existing concepts from earlier PDFs (master list)
+    all_kept = list(existing_concepts) if existing_concepts else []
     dropped_pairs: list[tuple[str, str]] = []
 
     for concept in concepts:
-        duplicate_of = find_near_duplicate(concept, kept, cutoff=0.9) if kept else None
+        duplicate_of = find_near_duplicate(concept, all_kept, cutoff=0.9) if all_kept else None
         if duplicate_of and is_safe_near_duplicate(concept, duplicate_of):
             dropped_pairs.append((concept, duplicate_of))
             continue
-        kept.append(concept)
+        all_kept.append(concept)
 
-    return kept, dropped_pairs
+    # Return only the newly-kept concepts (not existing ones)
+    # Caller will maintain the master list separately
+    new_concepts = all_kept[len(existing_concepts) if existing_concepts else 0:]
+    return new_concepts, dropped_pairs
